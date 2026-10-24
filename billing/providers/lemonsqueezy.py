@@ -3,7 +3,7 @@
 import hashlib
 import hmac
 
-from billing.errors import InvalidWebhook, ProviderUnavailable
+from billing.errors import CheckoutNotCreated, InvalidWebhook, ProviderUnavailable
 from .base import Event, Provider, Snapshot, decode_event, identifier, safe_url, timestamp
 
 
@@ -16,13 +16,24 @@ class LemonSqueezyProvider(Provider):
                    "Accept": "application/vnd.api+json", "Content-Type": "application/vnd.api+json"}
         return super().request(method, path, headers=headers, **kwargs)
 
-    def checkout(self, intent, email):
-        prices = self.request("GET", "/v1/prices", params={
-            "filter[variant_id]": intent.product_id, "page[size]": 1}).get("data", [])
+    def validate_plan(self, product_id):
+        try:
+            prices = self.request("GET", "/v1/prices", params={
+                "filter[variant_id]": product_id, "page[size]": 1}).get("data", [])
+        except ProviderUnavailable as exc:
+            raise CheckoutNotCreated(str(exc)) from exc
         price = prices[0].get("attributes", {}) if prices else {}
-        if (str(price.get("variant_id")) != intent.product_id or price.get("category") != "subscription"
+        if not prices:
+            raise CheckoutNotCreated("No price found for the configured Lemon Squeezy variant. Check the variant ID, API key and test/live mode")
+        if (str(price.get("variant_id")) != product_id or price.get("category") != "subscription"
                 or price.get("scheme") != "standard" or price.get("usage_aggregation") is not None):
-            raise ProviderUnavailable("The configured membership price is unavailable")
+            raise CheckoutNotCreated("Configure a standard, non-metered Lemon Squeezy subscription variant")
+
+    def check_store(self):
+        self.request("GET", "/v1/stores/" + identifier(self.config["LEMONSQUEEZY_STORE_ID"]))
+
+    def checkout(self, intent, email):
+        self.validate_plan(intent.product_id)
         payload = {"data": {"type": "checkouts", "attributes": {
             "checkout_options": {"embed": True},
             "checkout_data": {"email": email, "custom": {"checkout_ref": intent.id}},
@@ -36,7 +47,7 @@ class LemonSqueezyProvider(Provider):
             raise InvalidWebhook("Provider mode mismatch")
         return safe_url(obj.get("url"), self.name)
 
-    def event(self, raw, headers):
+    def verify_payload(self, raw, headers):
         expected = hmac.new(self.config["LEMONSQUEEZY_WEBHOOK_SECRET"].encode(), raw, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, headers.get("X-Signature", "")):
             raise InvalidWebhook("Invalid webhook signature")
@@ -47,6 +58,14 @@ class LemonSqueezyProvider(Provider):
         mode = meta.get("test_mode", payload.get("data", {}).get("attributes", {}).get("test_mode"))
         if mode is not None and mode is not (not self.live):
             raise InvalidWebhook("Webhook mode mismatch")
+        payload["_delivery_id"] = hashlib.sha256(raw).hexdigest()
+        return payload
+
+    def event(self, raw, headers):
+        return self.event_from_payload(self.verify_payload(raw, headers))
+
+    def event_from_payload(self, payload):
+        meta = payload.get("meta", {})
         kind = meta.get("event_name", "")
         data = payload.get("data", {})
         if kind in {"subscription_created", "subscription_updated", "subscription_cancelled",
@@ -63,7 +82,7 @@ class LemonSqueezyProvider(Provider):
             return None
         # Lemon Squeezy has no stable event ID or signed timestamp. Hash raw bytes for dedup;
         # fetch authoritative state on every new delivery to make old signed replays harmless.
-        return Event(hashlib.sha256(raw).hexdigest(), kind, identifier(sub_id),
+        return Event(payload["_delivery_id"], kind, identifier(sub_id),
                      (meta.get("custom_data") or {}).get("checkout_ref"),
                      kind == "subscription_payment_refunded")
 
@@ -92,3 +111,18 @@ class LemonSqueezyProvider(Provider):
         if str(obj.get("customer_id")) != subscription.customer_id:
             raise InvalidWebhook("Subscription ownership mismatch")
         return safe_url(obj.get("urls", {}).get("customer_portal"), self.name)
+
+    def list_subscriptions(self, cursor=None):
+        page = int(cursor or 1)
+        data = self.request('GET', '/v1/subscriptions', params={
+            'filter[store_id]': self.config['LEMONSQUEEZY_STORE_ID'], 'page[number]': page, 'page[size]': 100})
+        records = []
+        for item in data.get('data', []):
+            attributes = item['attributes']
+            if (str(attributes.get('store_id')) != self.config['LEMONSQUEEZY_STORE_ID']
+                    or attributes.get('test_mode') is not (not self.live)):
+                raise InvalidWebhook('Subscription store or mode mismatch during reconciliation')
+            records.append({'id': identifier(item['id']), 'product_id': identifier(attributes['variant_id']),
+                            'checkout_ref': None})
+        last_page = int(data.get('meta', {}).get('page', {}).get('lastPage', page))
+        return records, page + 1 if page < last_page else None

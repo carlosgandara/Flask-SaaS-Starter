@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import time
 
-from billing.errors import InvalidWebhook, ProviderUnavailable
+from billing.errors import CheckoutNotCreated, InvalidWebhook, ProviderUnavailable
 from .base import Event, Provider, Snapshot, decode_event, identifier, safe_url, timestamp
 
 
@@ -19,12 +19,18 @@ class StripeProvider(Provider):
         headers.update(kwargs.pop("headers", {}))
         return super().request(method, path, headers=headers, **kwargs)
 
-    def checkout(self, intent, email):
-        price = self.request("GET", "/v1/prices/" + identifier(intent.product_id))
+    def validate_plan(self, product_id):
+        try:
+            price = self.request("GET", "/v1/prices/" + identifier(product_id))
+        except ProviderUnavailable as exc:
+            raise CheckoutNotCreated(str(exc)) from exc
         if (price.get("livemode") is not self.live or price.get("active") is not True
                 or price.get("type") != "recurring" or not price.get("recurring")
                 or price["recurring"].get("usage_type") != "licensed"):
-            raise ProviderUnavailable("The configured membership price is unavailable")
+            raise CheckoutNotCreated("Configure an active recurring Stripe price in the selected test/live mode")
+
+    def checkout(self, intent, email):
+        self.validate_plan(intent.product_id)
         base = self.config["BILLING_BASE_URL"]
         data = {"mode": "subscription", "line_items[0][price]": intent.product_id,
                 "line_items[0][quantity]": "1", "customer_email": email,
@@ -41,7 +47,7 @@ class StripeProvider(Provider):
             raise InvalidWebhook("Provider mode mismatch")
         return safe_url(result.get("url"), self.name)
 
-    def event(self, raw, headers):
+    def verify_payload(self, raw, headers):
         try:
             fields = [part.split("=", 1) for part in headers.get("Stripe-Signature", "").split(",")]
             times = [value for key, value in fields if key == "t"]
@@ -59,6 +65,12 @@ class StripeProvider(Provider):
         payload = decode_event(raw)
         if payload.get("livemode") is not self.live:
             raise InvalidWebhook("Webhook mode mismatch")
+        return payload
+
+    def event(self, raw, headers):
+        return self.event_from_payload(self.verify_payload(raw, headers))
+
+    def event_from_payload(self, payload):
         kind = payload.get("type", "")
         obj = payload.get("data", {}).get("object", {})
         ref = None
@@ -119,3 +131,19 @@ class StripeProvider(Provider):
             "customer": subscription.customer_id,
             "return_url": self.config["BILLING_BASE_URL"] + "/billing/membership"})
         return safe_url(result.get("url"), self.name)
+
+    def list_subscriptions(self, cursor=None):
+        params = {'limit': 100, 'status': 'all'}
+        if cursor:
+            params['starting_after'] = identifier(cursor)
+        data = self.request('GET', '/v1/subscriptions', params=params)
+        records = []
+        for item in data.get('data', []):
+            if item.get('livemode') is not self.live:
+                raise InvalidWebhook('Subscription mode mismatch during reconciliation')
+            items = item.get('items', {}).get('data', [])
+            if len(items) != 1:
+                continue
+            records.append({'id': identifier(item['id']), 'product_id': identifier(items[0]['price']['id']),
+                            'checkout_ref': (item.get('metadata') or {}).get('checkout_ref')})
+        return records, identifier(data['data'][-1]['id']) if data.get('has_more') and data.get('data') else None

@@ -1,230 +1,120 @@
-// ============================================================
-// COMMON UTILITIES
-// ============================================================
+/* Shared browser transport: CSRF for mutations and coordinated session refresh. */
+let csrfValue = document.getElementById('auth-csrf-token')?.content || '';
+let refreshInFlight = null;
 
-/**
- * Authenticated fetch - automatically handles 401 errors
- * by calling /refresh and retrying the request.
- */
-async function authenticatedFetch(url, options = {}, redirectOnFailure = true) {
-    let response = await fetch(url, options);
-    
-    if (response.status === 401) {
-        const toast = document.getElementById('toast');
-        if (toast) {
-            toast.textContent = '⏳ Refreshing session...';
-            toast.className = 'show';
+async function authFetch(url, options = {}) {
+    const method = (options.method || 'GET').toUpperCase();
+    const headers = {...(options.headers || {})};
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+        if (!csrfValue) {
+            const response = await fetch('/auth/csrf', {credentials: 'same-origin', cache: 'no-store'});
+            if (!response.ok) throw new Error('Unable to prepare a secure request. Reload this page.');
+            csrfValue = (await response.json()).csrf_token;
         }
-        
-        const refreshResponse = await fetch('/refresh', { method: 'POST' });
-        if (refreshResponse.ok) {
-            if (toast) {
-                toast.textContent = '✅ Session refreshed silently!';
-                setTimeout(() => { toast.className = ''; }, 2000);
-            }
-            response = await fetch(url, options);
-        } else if (redirectOnFailure) {
-            window.location.href = '/login';
-        }
+        headers['X-CSRF-Token'] = csrfValue;
     }
+    return fetch(url, {...options, credentials: 'same-origin', headers});
+}
+
+async function refreshSession() {
+    if (!refreshInFlight) {
+        refreshInFlight = authFetch('/refresh', {method: 'POST'}).finally(() => { refreshInFlight = null; });
+    }
+    return refreshInFlight;
+}
+
+async function authenticatedFetch(url, options = {}, redirectOnFailure = true) {
+    let response = await authFetch(url, options);
+    if (response.status !== 401) return response;
+    async function restore() {
+        // Web Locks coordinate tabs. Probe before refreshing because another tab
+        // may already have rotated the shared cookies while this one waited.
+        if (typeof navigator !== 'undefined' && navigator.locks) {
+            return navigator.locks.request('auth-session-refresh', async () => {
+                const probe = await authFetch('/auth/session', {cache: 'no-store'});
+                return probe.ok || (await refreshSession()).ok;
+            });
+        }
+        return (await refreshSession()).ok;
+    }
+    if (await restore()) response = await authFetch(url, options);
+    if (response.status === 401 && redirectOnFailure) window.location.href = '/login';
     return response;
 }
 
-/**
- * Logout - calls /logout and redirects to login page.
- */
 async function logout() {
-    await fetch('/logout', { method: 'POST' });
-    window.location.href = '/login';
+    try {
+        const response = await authFetch('/logout', {method: 'POST'});
+        if (!response.ok) throw new Error('Could not sign out. Please try again.');
+        window.location.href = '/login';
+    } catch (error) {
+        const message = document.getElementById('auth-message');
+        if (message) message.textContent = error.message;
+    }
 }
 
-
-// ============================================================
-// LOGIN PAGE
-// ============================================================
-
-if (document.getElementById('login-form')) {
-    document.getElementById('login-form').onsubmit = async (e) => {
-        e.preventDefault();
-        const email = document.getElementById('email').value;
-        const password = document.getElementById('password').value;
-        const msg = document.getElementById('msg');
-        
-        msg.textContent = 'Logging in...';
-        msg.className = '';
-
+const forms = [
+    ['login-form', '/login', () => ({email: document.getElementById('email').value, password: document.getElementById('password').value})],
+    ['register-form', '/register', () => ({email: document.getElementById('email').value, password: document.getElementById('password').value})],
+    ['forgot-password-form', '/forgot-password', () => ({email: document.getElementById('email').value})],
+    ['resend-verification-form', '/resend-verification', () => ({email: document.getElementById('email').value})],
+    ['reset-password-form', '/reset-password', () => ({token: new URLSearchParams(window.location.search).get('token'), new_password: document.getElementById('new_password').value})]
+];
+for (const [id, endpoint, payload] of forms) {
+    const form = document.getElementById(id);
+    if (!form) continue;
+    let submitting = false;
+    form.addEventListener('submit', async event => {
+        event.preventDefault();
+        if (submitting) return;
+        submitting = true;
+        const button = form.querySelector('button[type="submit"]');
+        const message = document.getElementById('msg');
+        if (button) button.disabled = true;
+        message.textContent = 'Please wait…';
+        message.className = '';
         try {
-            const res = await fetch('/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email, password })
-            });
-            const data = await res.json();
-
-            if (res.ok) {
-                msg.className = 'success';
-                msg.textContent = '✅ Login successful! Redirecting...';
-                setTimeout(() => window.location.href = '/dashboard', 800);
-            } else {
-                msg.className = 'error';
-                msg.textContent = data.error || 'Login failed';
-            }
-        } catch (err) {
-            msg.className = 'error';
-            msg.textContent = 'Network error: ' + err.message;
+            const response = await authFetch(endpoint, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload())});
+            const data = await response.json();
+            if (!response.ok) throw new Error((data.error || 'Request failed.') + (data.reference ? ` Reference: ${data.reference}` : ''));
+            message.className = 'success';
+            message.textContent = data.message;
+            if (endpoint === '/login') window.location.href = '/dashboard';
+        } catch (error) {
+            message.className = 'error';
+            message.textContent = error.message || 'Unable to connect. Try again.';
+        } finally {
+            submitting = false;
+            if (button) button.disabled = false;
         }
-    };
+    });
 }
 
-
-// ============================================================
-// REGISTER PAGE
-// ============================================================
-
-if (document.getElementById('register-form')) {
-    document.getElementById('register-form').onsubmit = async (e) => {
-        e.preventDefault();
-        const email = document.getElementById('email').value;
-        const password = document.getElementById('password').value;
-        const msg = document.getElementById('msg');
-
-        try {
-            const res = await fetch('/register', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email, password })
-            });
-            const data = await res.json();
-
-            if (res.ok) {
-                msg.className = 'success';
-                msg.textContent = data.message;
-            } else {
-                msg.className = 'error';
-                msg.textContent = data.error || 'Register failed';
-            }
-        } catch (err) {
-            msg.className = 'error';
-            msg.textContent = 'Network error: ' + err.message;
-        }
-    };
+async function fetchProtectedData() {
+    const output = document.getElementById('api-response');
+    if (!output) return;
+    output.textContent = 'Loading…';
+    try {
+        const response = await authenticatedFetch('/protected');
+        const data = await response.json();
+        output.textContent = response.ok ? data.message : (data.error || 'Unable to load data');
+    } catch (error) { output.textContent = 'Unable to connect. Try again.'; }
 }
-
-
-// ============================================================
-// FORGOT PASSWORD PAGE
-// ============================================================
-
-if (document.getElementById('forgot-password-form')) {
-    document.getElementById('forgot-password-form').onsubmit = async (e) => {
-        e.preventDefault();
-        const email = document.getElementById('email').value;
-        const msg = document.getElementById('msg');
-
-        try {
-            const res = await fetch('/forgot-password', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email })
-            });
-            const data = await res.json();
-
-            msg.className = 'success';
-            msg.textContent = data.message;
-        } catch (err) {
-            msg.className = 'error';
-            msg.textContent = 'Network error: ' + err.message;
-        }
-    };
-}
-
-
-// ============================================================
-// RESET PASSWORD PAGE
-// ============================================================
-
-if (document.getElementById('reset-password-form')) {
-    // Get token from URL query string
-    const urlParams = new URLSearchParams(window.location.search);
-    const token = urlParams.get('token');
-
-    document.getElementById('reset-password-form').onsubmit = async (e) => {
-        e.preventDefault();
-        const new_password = document.getElementById('new_password').value;
-        const msg = document.getElementById('msg');
-
-        if (!token) {
-            msg.className = 'error';
-            msg.textContent = 'Missing reset token. Please use the link from your email.';
-            return;
-        }
-
-        try {
-            const res = await fetch('/reset-password', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ token, new_password })
-            });
-            const data = await res.json();
-
-            if (res.ok) {
-                msg.className = 'success';
-                msg.textContent = data.message;
-            } else {
-                msg.className = 'error';
-                msg.textContent = data.error || 'Reset failed';
-            }
-        } catch (err) {
-            msg.className = 'error';
-            msg.textContent = 'Network error: ' + err.message;
-        }
-    };
-}
-
-
-// ============================================================
-// DASHBOARD PAGE
-// ============================================================
-
 if (document.getElementById('api-response')) {
-    async function fetchProtectedData() {
-        const pre = document.getElementById('api-response');
-        pre.textContent = 'Fetching...';
-        try {
-            const response = await authenticatedFetch('/protected');
-            const data = await response.json();
-            pre.textContent = JSON.stringify(data, null, 2);
-        } catch (error) {
-            pre.textContent = 'Error: ' + error.message;
-        }
-    }
-
     document.getElementById('refresh-data')?.addEventListener('click', fetchProtectedData);
-    // Auto-fetch protected data when page loads
-    window.onload = fetchProtectedData;
+    fetchProtectedData();
 }
-
-
-// ============================================================
-// PROFILE PAGE
-// ============================================================
-
 if (document.getElementById('user-email')) {
-    async function fetchUserInfo() {
-        try {
-            const response = await authenticatedFetch('/protected');
-            const data = await response.json();
-            document.getElementById('user-email').textContent = '👤 ' + data.message;
-        } catch (error) {
-            document.getElementById('user-email').textContent = 'Error loading profile';
-        }
-    }
-
-    // Auto-fetch user info when page loads
-    window.onload = fetchUserInfo;
+    authenticatedFetch('/protected').then(async response => {
+        const data = await response.json();
+        document.getElementById('user-email').textContent = response.ok ? data.message : 'Please sign in again.';
+    }).catch(() => { document.getElementById('user-email').textContent = 'Unable to load your profile.'; });
 }
+document.querySelectorAll('[data-action="logout"]').forEach(button => button.addEventListener('click', logout));
 
-// External listeners keep navigation actions compatible with the strict CSP.
-document.querySelectorAll('[data-action="logout"]').forEach(button => {
-    button.addEventListener('click', logout);
-});
+if (document.getElementById('auth-session-recovery')) {
+    const message = document.getElementById('auth-session-recovery');
+    authenticatedFetch('/auth/session', {cache: 'no-store'}).then(response => {
+        if (response.ok) window.location.replace(window.location.pathname + window.location.search);
+    }).catch(() => { message.textContent = 'Unable to restore your session. Refresh this page or sign in again.'; });
+}

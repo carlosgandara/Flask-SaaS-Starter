@@ -15,3 +15,15 @@ class InvalidWebhook(BillingError):
 
 class BillingConflict(BillingError):
     status_code = 409
+
+
+class CheckoutNotCreated(ProviderUnavailable):
+    """A preflight GET failed before a payment POST could have been sent."""
+
+
+class SyncBusy(ProviderUnavailable):
+    pass
+
+
+class UnmatchedCheckout(ProviderUnavailable):
+    pass

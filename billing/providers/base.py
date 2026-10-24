@@ -96,6 +96,10 @@ class Provider:
             if not 200 <= response.status_code < 300:
                 logging.getLogger(__name__).warning("billing.provider_http_error provider=%s status=%s",
                                                     type(self).__name__, response.status_code)
+                if response.status_code == 404:
+                    raise ProviderUnavailable("Payment resource not found. Check configured IDs and test/live mode")
+                if response.status_code in {401, 403}:
+                    raise ProviderUnavailable("Payment provider rejected the API credentials or permissions")
                 raise ProviderUnavailable("Payment provider is temporarily unavailable")
             result = response.json()
             if not isinstance(result, dict):

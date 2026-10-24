@@ -9,7 +9,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from auth.db import SessionLocal, User
-from .errors import BillingConflict, BillingError, InvalidWebhook
+from .errors import BillingConflict, BillingError, CheckoutNotCreated, InvalidWebhook, UnmatchedCheckout
 from .models import CheckoutIntent, Subscription, WebhookReceipt
 
 TERMINAL_STATUSES = {"canceled", "expired", "incomplete_expired"}
@@ -97,7 +97,15 @@ def create_checkout(user_id, plan_key):
     # If the network times out, keep it pending; an ambiguous POST must not be auto-retried.
     with SessionLocal() as db:
         intent = db.get(CheckoutIntent, reference)
-        url = provider_for(plan["provider"]).checkout(intent, email)
+        try:
+            url = provider_for(plan["provider"]).checkout(intent, email)
+        except CheckoutNotCreated:
+            with SessionLocal.begin() as failed_db:
+                lock_user(failed_db, user_id)
+                failed = failed_db.get(CheckoutIntent, reference)
+                if failed.state == "pending" and not failed.checkout_url:
+                    failed.state = "failed"
+            raise
     with SessionLocal.begin() as db:
         lock_user(db, user_id)
         intent = db.get(CheckoutIntent, reference)
@@ -127,63 +135,65 @@ def record_event(db, provider, event):
 
 
 def process_event(provider_name, event):
-    """Receipt and state commit together. Failure rolls both back for provider retry."""
+    """Fetch outside transactions; a fenced lease orders subscription snapshots."""
+    from .leases import acquire, fence, release
     provider = provider_for(provider_name)
     mode = settings()["BILLING_MODE"]
-    with SessionLocal.begin() as db:
-        query = select(Subscription).where(Subscription.provider == provider_name,
-                                          Subscription.mode == mode,
-                                          Subscription.external_id == event.subscription_id)
-        row = db.execute(query).scalar_one_or_none()
-        reference = event.checkout_ref
-        if row is None and not reference:
-            # Stripe invoice events can arrive before subscription_created.
-            reference = provider.subscription(event.subscription_id).checkout_ref
-        intent = db.get(CheckoutIntent, reference) if isinstance(reference, str) else None
-        if row is None:
-            if intent is None or intent.provider != provider_name or intent.mode != mode:
-                raise InvalidWebhook("Subscription is not linked to an app checkout")
-            user_id = intent.user_id
-        else:
-            user_id = row.user_id
-        lock_user(db, user_id)
-        if intent is not None:
-            # Refresh identity-map state after waiting for another worker's transaction.
-            db.refresh(intent)
-        # Reread after acquiring the lock; another worker may have created the row.
-        row = db.execute(query.execution_options(populate_existing=True)).scalar_one_or_none()
-        if row is not None and row.user_id != user_id:
-            raise InvalidWebhook("Subscription owner mismatch")
-        if not record_event(db, provider_name, event):
+    with SessionLocal() as db:
+        if db.execute(select(WebhookReceipt.id).where(WebhookReceipt.provider == provider_name,
+                WebhookReceipt.mode == mode, WebhookReceipt.event_id == event.id)).first():
             return "duplicate"
-        # Retrieve under the user lock. Event timestamps alone cannot order equal-second
-        # or delayed events safely, and Lemon Squeezy has no signed delivery timestamp.
+    lease_key = f"{provider_name}:{mode}:{event.subscription_id}"
+    lease_token = acquire(lease_key)
+    try:
         snapshot = provider.subscription(event.subscription_id)
         if snapshot.id != event.subscription_id:
             raise InvalidWebhook("Subscription identifier mismatch")
-        if row is None:
-            if intent.subscription_id and intent.subscription_id != snapshot.id:
-                raise InvalidWebhook("Checkout reference was already used")
-            if snapshot.product_id != intent.product_id:
-                raise InvalidWebhook("Checkout product mismatch")
-            if snapshot.checkout_ref and snapshot.checkout_ref != intent.id:
-                raise InvalidWebhook("Checkout reference mismatch")
-            row = Subscription(user_id=user_id, provider=provider_name, mode=mode,
-                               external_id=snapshot.id, customer_id=snapshot.customer_id,
-                               product_id=snapshot.product_id, status=snapshot.status)
-            db.add(row)
-            intent.subscription_id = snapshot.id
-            intent.state = "completed"
-        elif row.customer_id != snapshot.customer_id:
-            raise InvalidWebhook("Subscription customer mismatch")
-        row.plan_key = next((key for key, plan in settings()["BILLING_PLANS"].items()
-                             if plan["provider"] == provider_name and plan["product_id"] == snapshot.product_id), None)
-        row.product_id = snapshot.product_id
-        row.status = snapshot.status
-        row.access_until = snapshot.access_until
-        row.cancel_at_period_end = snapshot.cancel_at_period_end
-        row.blocked = bool(row.blocked or event.block_access)
-        row.updated_at = datetime.utcnow()
-    current_app.logger.info("billing.event_processed provider=%s event=%s subscription=%s",
-                            provider_name, event.id, event.subscription_id)
-    return "processed"
+        with SessionLocal.begin() as db:
+            fence(db, lease_key, lease_token)
+            query = select(Subscription).where(Subscription.provider == provider_name,
+                Subscription.mode == mode, Subscription.external_id == event.subscription_id)
+            row = db.execute(query).scalar_one_or_none()
+            reference = event.checkout_ref or snapshot.checkout_ref
+            intent = db.get(CheckoutIntent, reference) if isinstance(reference, str) else None
+            if row is None:
+                if intent is None or intent.provider != provider_name or intent.mode != mode:
+                    raise UnmatchedCheckout("Subscription needs checkout-link review")
+                user_id = intent.user_id
+            else:
+                user_id = row.user_id
+            lock_user(db, user_id)
+            if intent is not None:
+                db.refresh(intent)
+            row = db.execute(query.execution_options(populate_existing=True)).scalar_one_or_none()
+            if row is not None and row.user_id != user_id:
+                raise InvalidWebhook("Subscription owner mismatch")
+            if not record_event(db, provider_name, event):
+                return "duplicate"
+            if row is None:
+                if intent.subscription_id and intent.subscription_id != snapshot.id:
+                    raise InvalidWebhook("Checkout reference was already used")
+                if snapshot.product_id != intent.product_id:
+                    raise InvalidWebhook("Checkout product mismatch")
+                if snapshot.checkout_ref and snapshot.checkout_ref != intent.id:
+                    raise InvalidWebhook("Checkout reference mismatch")
+                row = Subscription(user_id=user_id, provider=provider_name, mode=mode,
+                    external_id=snapshot.id, customer_id=snapshot.customer_id,
+                    product_id=snapshot.product_id, status=snapshot.status)
+                db.add(row)
+                intent.subscription_id = snapshot.id
+                intent.state = "completed"
+            elif row.customer_id != snapshot.customer_id:
+                raise InvalidWebhook("Subscription customer mismatch")
+            row.plan_key = next((key for key, plan in settings()["BILLING_PLANS"].items()
+                if plan["provider"] == provider_name and plan["product_id"] == snapshot.product_id), None)
+            row.product_id, row.status = snapshot.product_id, snapshot.status
+            row.access_until = snapshot.access_until
+            row.cancel_at_period_end = snapshot.cancel_at_period_end
+            row.blocked = bool(row.blocked or event.block_access)
+            row.updated_at = datetime.utcnow()
+        current_app.logger.info("billing.event_processed provider=%s event=%s subscription=%s",
+                                provider_name, event.id, event.subscription_id)
+        return "processed"
+    finally:
+        release(lease_key, lease_token)

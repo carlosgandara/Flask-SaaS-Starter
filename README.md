@@ -1,129 +1,181 @@
-# Flask authentication with optional subscription billing
+# Flask SaaS Starter
 
-A Flask application with email verification, password reset, bcrypt password
-hashing, HttpOnly JWT cookies, refresh-token rotation, and optional hosted
-subscription checkout through Stripe or Lemon Squeezy.
+Flask authentication and optional subscription billing through Lemon Squeezy or
+Stripe. Each application owns its users, subscriptions and database.
 
-## Project layout
+## Boundaries
 
-```text
-app.py                         Application creation and module registration
-auth/
-    __init__.py                Auth blueprint, limiter, security headers
-    routes.py                  Authentication pages and API
-    config.py                  Authentication environment settings
-    db.py                      Shared database engine and auth tables
-    mail_service.py            SMTP email
-    static/css/app.css
-    static/js/app.js
-    templates/auth/            Authentication HTML pages
-billing/
-    config.py                  Optional billing configuration and plan catalog
-    routes.py                  Checkout, portal, status, signed webhooks
-    service.py                 Transactional subscription rules
-    models.py                  Billing database tables
-    access.py                  Server-side paid-access checks
-    providers/                 Separate Stripe and Lemon Squeezy adapters
-    templates/billing/         Pricing and membership pages
-    static/js/billing.js
-    README.md                  Billing setup, policies, security, debugging
-.env.example                   Blank/example settings, no credentials
-tests/test_billing.py          Isolated billing regression/security tests
+| Location | Responsibility |
+| --- | --- |
+| `app.py`, `configuration.py` | Application creation and deployment validation |
+| `auth/routes.py` | HTTP input, cookies and safe responses |
+| `auth/service.py` | Account, password, session and token transactions |
+| `auth/security.py`, `auth/validation.py` | Authentication, CSRF and input validation |
+| `auth/db.py` | Shared database connection and auth models |
+| `auth/mail_service.py` | Bounded SMTP delivery over verified TLS |
+| `billing/routes.py`, `billing/service.py` | Checkout and membership rules |
+| `billing/providers/` | Separate Lemon Squeezy and Stripe integrations |
+| `billing/inbox.py`, `billing/worker.py`, `billing/leases.py` | Durable deliveries, retries and reconciliation |
+| `diagnostics.py` | Safe error references and readiness checks |
+| `migrations/` | Versioned database upgrades |
+| `tests/`, `.github/workflows/checks.yml` | Regression, concurrency and dependency checks |
+
+## Local setup
+
+Use Python 3.10 or newer. On Windows PowerShell, from the project directory:
+
+```powershell
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-Each independent app can reuse this starter with its own database and provider
-products. Authentication and billing tables live in that app's same database.
+Copy the example only for a new installation; preserve an existing private `.env`.
+Set a random `JWT_SECRET_KEY`, SMTP credentials and `DATABASE_URL`. The example
+explains every setting. Neon/PostgreSQL is required for production; SQLite is
+available for development. Generate a secret with:
 
-## Development setup
-
-1. Create a Python virtual environment and install dependencies:
-
-```bash
-python -m venv venv
-# Git Bash on Windows:
-source venv/Scripts/activate
-pip install -r requirements.txt
-```
-
-2. Copy `.env.example` to `.env` and configure SMTP, DATABASE_URL, and
-   JWT_SECRET_KEY. Keep `.env` private. Generate a random JWT secret:
-
-```bash
+```powershell
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-The app refuses to start with a missing, blank, or shorter-than-32-byte JWT
-secret. PostgreSQL/Neon is recommended; without DATABASE_URL, auth falls back to
-local SQLite for development. Auth creates missing auth tables at import time.
-Use a separate database for tests and staging, never production customer data.
+Apply the schema explicitly, check readiness, then start the development server:
 
-3. Start locally:
-
-```bash
-python app.py
+```powershell
+.venv/Scripts/python.exe -m flask --app app db-upgrade
+.venv/Scripts/python.exe -m flask --app app app-check
+.venv/Scripts/python.exe app.py
 ```
 
-Open http://localhost:5000/login. Billing stays disabled until configured. Debug
-mode is off by default; enable it only in a private local development environment.
-Do not deploy Flask's development server to production.
+Open http://localhost:5000/login. Use the exact origin in `BASE_URL`; localhost
+and 127.0.0.1 have separate cookies. Importing the application never creates or
+alters database tables. `db-upgrade` upgrades the configured database; it does
+not create a separate Neon database. Billing tables are included even when
+billing is disabled. Missing schema produces an actionable 503 response.
 
-## Authentication
+## Upgrading an existing installation
 
-- Register and verify your email, then log in.
-- Access tokens expire after one minute. Refresh tokens expire after 30 days.
-- The frontend refreshes an expired access token after a protected API returns
-  401. It does not run a one-minute refresh timer.
-- Reloading an HTML page after access-token expiry currently redirects to login.
-- Logout revokes refresh tokens. Existing access JWTs remain valid until expiry;
-  logout-all/reset do not immediately invalidate already-issued access JWTs.
-- `/health` is a basic application response, not an actual database connectivity
-  probe. Do not use its static database label as proof of database availability.
+Back up the database and test on a staging copy before applying migrations.
+Install the updated requirements, then run `db-upgrade` once before restarting
+the web service and worker. PostgreSQL migration runs are serialized.
+
+The baseline migration preserves users, password hashes, subscriptions, checkout
+intents and processed-event receipts. It normalizes email case/whitespace and
+refuses ambiguous duplicate identities rather than merging accounts. Review and
+resolve those identities before retrying. Legacy verification/reset links are
+invalidated; request a new link through Forgot password or Resend verification.
+Old access JWTs lack the new session identifier and are rejected. A valid legacy
+refresh cookie can be adopted once; otherwise log in again. A destructive automatic
+downgrade is intentionally unavailable. Restore a reviewed backup if rollback is needed.
+
+## Authentication behavior
+
+- Email verification is required before login. Email identities are validated and
+  normalized, with a database uniqueness constraint.
+- Access JWTs expire after one minute. Refresh rotates on demand after a protected
+  request returns 401. Each login session has a fixed maximum lifetime of 30 days.
+- Database-backed sessions allow logout, logout-all and password reset to revoke
+  existing access immediately. Refresh reuse revokes that session's descendants.
+- Password reset and verification tokens are random, stored as indexed SHA256
+  hashes, expire, and can be consumed only once. Password hashes use bcrypt; inputs
+  longer than 72 UTF-8 bytes are rejected rather than silently truncated.
+- Login failure counts are updated under a database lock. Five failures lock the
+  account for 15 minutes; shared Redis request limits also apply in production.
+- All browser POSTs, including login/refresh/logout, require a signed-session CSRF
+  token and the configured Origin. Custom clients must fetch `/auth/csrf`, retain
+  cookies and send `X-CSRF-Token` and `Origin` headers.
+- Expired HTML sessions recover through a data-free page. Browser refresh calls
+  share one promise; Web Locks coordinate supported browsers across tabs.
+- SMTP delivery has a timeout and verified TLS. Delivery failures have a safe
+  reference; users can request a replacement link. Email is not a background queue.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET/POST | `/register` | Registration page / register |
-| GET | `/verify-email` | Verify emailed token |
-| GET/POST | `/login` | Login page / set auth cookies |
-| POST | `/refresh` | Rotate refresh token and issue access cookie |
-| GET | `/dashboard`, `/profile` | Authenticated HTML pages |
-| GET | `/protected` | Example authenticated API |
-| POST | `/logout`, `/logout-all` | Revoke refresh tokens and clear cookies |
-| GET/POST | `/forgot-password` | Reset request page / send email |
-| GET/POST | `/reset-password` | Reset page / update password |
-| GET | `/health` | Basic application status |
+| GET/POST | `/register`, `/login` | Account creation and login |
+| GET | `/verify-email` | Consume emailed verification link |
+| GET/POST | `/resend-verification`, `/forgot-password` | Request a fresh email link |
+| GET/POST | `/reset-password` | Reset form / consume reset token |
+| GET | `/auth/csrf`, `/auth/session` | CSRF bootstrap / authenticated session probe |
+| POST | `/refresh`, `/logout`, `/logout-all` | Rotate / revoke sessions |
+| GET | `/dashboard`, `/profile`, `/protected` | Example protected pages/API |
+| GET | `/health` | Database connectivity and application readiness |
 
-The application has no `/change-password` endpoint. Resetting a password uses the
-email flow. Browser actions use external scripts compatible with the strict CSP.
+## Billing and background worker
 
-## Billing
+Follow [billing setup and recovery](billing/README.md) for provider configuration,
+webhook events, membership policy and operator commands. Before checkout:
 
-See [billing setup and architecture](billing/README.md) for provider configuration,
-webhook events, table installation, membership checks, cancellation/refund policy,
-and recovery commands. No real charges or provider products are created by setup.
-
-```bash
-flask --app app billing-init-db
-python -m unittest discover -s tests -v
+```powershell
+.venv/Scripts/python.exe -m flask --app app billing-check
 ```
 
-Billing has verified webhook signatures, CSRF-protected actions, ownership checks,
-server-owned plan IDs, transactional deduplication, PostgreSQL user-row locking,
-and explicit membership expiry. Live billing enforces HTTPS, secure cookies,
-PostgreSQL, and shared Redis rate-limit storage. Initial table creation is explicit;
-future existing-table changes need reviewed migrations.
+Run the worker in a second terminal, with the same configuration and database:
 
-## Security and operational scope
+```powershell
+.venv/Scripts/python.exe -m flask --app app billing-worker
+```
 
-Use long random secrets, production HTTPS, secure cookies, restricted database
-credentials, and monitored webhooks. The default rate-limit store is memory for
-local development; configure RATELIMIT_STORAGE_URI for shared limits. Authentication
-still contains process-local IP/user attempt tracking and non-atomic refresh
-rotation, which require a separate concurrency review before a multi-worker launch.
-This project is not a claim of a completed production security audit.
+Signed payment notifications are committed to the database before acknowledgement.
+The separate worker fetches current provider state, updates membership atomically,
+retries failures and periodically reconciles provider subscriptions. Checkout
+success messages and redirect parameters never grant access. The worker must be
+running for membership updates to be applied.
 
-Tests use a temporary in-memory database and mocked providers. Provider sandbox
-flows and PostgreSQL concurrent-delivery checks are required before real payments.
-See the billing documentation for the precise boundaries and remaining limitations.
+## Production deployment
+
+Set `APP_ENV=production`, HTTPS `BASE_URL`, `COOKIE_SECURE=True`, an explicit
+PostgreSQL URL and shared Redis storage. Startup rejects unsafe production settings.
+Use separate test/live databases and provider credentials. Provision backups,
+restricted database credentials and a stable HTTPS webhook endpoint.
+
+Run a production web server behind your TLS reverse proxy, and supervise the
+worker as a separate service with automatic restart:
+
+```text
+waitress-serve --host=127.0.0.1 --port=5000 app:app
+python -m flask --app app billing-worker
+```
+
+Set `TRUSTED_PROXY_HOPS` only to the actual number of trusted proxies and prevent
+direct public access to the backend. The default trusts no forwarded headers.
+Run `app-check` during deployment and monitor `billing-status --check`; a nonzero
+exit means attention is needed. Connect these to your hosting alert system;
+this repository does not provision hosting or send operator alerts by itself.
+
+Errors expose a request reference, not SQL parameters, tokens or provider bodies.
+Keep application/HTTP wire debug logging off. Configure proxy/access logs to omit
+query strings, Cookie/Authorization headers and webhook bodies because emailed
+links contain credentials. Protect CLI access with deployment IAM/OS permissions.
+This starter does not include MFA, passkeys, a security audit or an uptime guarantee.
+
+## Verification
+
+Run the Python tests in the application environment:
+
+```powershell
+.venv/Scripts/python.exe -m unittest discover -s tests -v
+node tests/test_auth_browser.cjs
+node tests/test_billing_browser.cjs
+node tests/test_checkout_overlay.cjs
+```
+
+Development/audit tools require Python 3.11 or newer (the application runtime
+still supports 3.10). In a separate 3.11+ environment, install and audit with:
+
+```powershell
+python -m pip install --upgrade pip setuptools
+python -m pip install -r requirements-dev.txt
+python -m pip_audit --local
+```
+
+Default tests use isolated SQLite and mocked providers. Set `TEST_POSTGRES_URL`
+and `TEST_REDIS_URL` to dedicated test services to run concurrency/shared-limit
+checks. PostgreSQL tests create and remove only their randomly named schema;
+Redis tests remove only their own random key prefix. Never point test services
+at customer databases. GitHub Actions provisions both services and tests Python
+3.12/3.13, browser behavior and dependencies. Enable required checks in repository
+branch protection after the workflow is pushed; local files do not enable that setting.
+Exercise a real provider sandbox checkout, webhook and portal before live payments.
 
 ## License
 

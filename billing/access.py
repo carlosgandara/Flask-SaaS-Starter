@@ -4,8 +4,7 @@ from functools import wraps
 
 from flask import current_app, g, jsonify, render_template, request
 
-from auth.db import find_user_by_email
-from auth.routes import is_authenticated, token_required
+from auth.security import authenticated_user, is_authenticated, token_required
 from .service import has_membership
 
 
@@ -27,7 +26,7 @@ def verified_user_required(function):
     @wraps(function)
     @token_required
     def decorated(*args, **kwargs):
-        user = find_user_by_email(request.user_email)
+        user = authenticated_user()
         if user is None or not user.verified:
             return jsonify(error="A verified account is required"), 403
         g.billing_user = user

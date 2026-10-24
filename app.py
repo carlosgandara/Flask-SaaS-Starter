@@ -6,6 +6,8 @@ from flask import Flask
 
 from auth import init_auth
 from billing import init_billing
+from configuration import configure_app
+from diagnostics import init_diagnostics
 
 
 def create_app(config=None):
@@ -18,8 +20,12 @@ def create_app(config=None):
     )
     if config:
         app.config.update(config)
+    configure_app(app)
+    init_diagnostics(app)
     init_auth(app)
     init_billing(app)
+    from database_migrations import init_migrations
+    init_migrations(app)
     return app
 
 app = create_app()

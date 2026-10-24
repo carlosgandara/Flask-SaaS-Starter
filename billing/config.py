@@ -36,6 +36,8 @@ def load_config(app):
         from auth.db import engine
         if engine.dialect.name != "postgresql":
             raise ValueError("Live billing requires PostgreSQL for transactional row locking")
+        if app.config["APP_ENV"] != "production":
+            raise ValueError("Live billing requires APP_ENV=production")
     plans = app.config["BILLING_PLANS"]
     if not isinstance(plans, dict) or not plans:
         raise ValueError("BILLING_PLANS must contain at least one plan")

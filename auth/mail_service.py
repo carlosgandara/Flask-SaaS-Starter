@@ -1,6 +1,7 @@
 # /auth/mail_service.py
 
 import smtplib
+import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -27,17 +28,11 @@ def send_email(to, subject, text, html=None):
     if html:
         message.attach(MIMEText(html, "html", "utf-8"))
 
-    try:
-        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.sendmail(
-                EMAIL_FROM,
-                [to],
-                message.as_string(),
-            )
-
-        print(f"Email sent to {to}")
-    except Exception as error:
-        print(f"Email failed: {error}")
-        raise
+    with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT, timeout=10) as server:
+        server.starttls(context=ssl.create_default_context())
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.sendmail(
+            EMAIL_FROM,
+            [to],
+            message.as_string(),
+        )

@@ -27,14 +27,24 @@ from app import create_app
 from auth.db import Base, SessionLocal, User, engine
 if engine.dialect.name != "sqlite" or engine.url.database != ":memory:":
     raise RuntimeError("Billing tests require a fresh process with an in-memory SQLite database")
-from auth.routes import generate_jwt
+from auth.routes import generate_jwt as mint_access_token
+from auth.db import AuthSession
 from billing.access import membership_required
 from billing.errors import InvalidWebhook, ProviderUnavailable
-from billing.models import CheckoutIntent, Subscription, WebhookReceipt
+from billing.models import CheckoutIntent, Subscription, WebhookInbox, WebhookReceipt
+from billing.worker import process_one
 from billing.providers.base import Event, Snapshot, safe_url
 from billing.providers.lemonsqueezy import LemonSqueezyProvider
 from billing.providers.stripe import StripeProvider
 from billing.service import has_membership, process_event
+
+
+def generate_jwt(email):
+    with SessionLocal.begin() as db:
+        user = db.execute(select(User).where(User.email == email)).scalar_one()
+        sid = secrets.token_urlsafe(32)
+        db.add(AuthSession(id=sid, user_id=user.id, expires_at=datetime.utcnow() + timedelta(days=30)))
+    return mint_access_token(email, sid)
 
 
 class BillingTests(unittest.TestCase):
@@ -55,13 +65,13 @@ class BillingTests(unittest.TestCase):
                           "provider": "lemonsqueezy", "product_id": "456"}},
         })
         with SessionLocal.begin() as db:
-            db.add_all([User(id=1, email="one@example.invalid", password="unused", verified=True),
-                        User(id=2, email="two@example.invalid", password="unused", verified=True),
-                        User(id=3, email="unverified@example.invalid", password="unused", verified=False)])
+            db.add_all([User(id=1, email="one@example.test", password="unused", verified=True),
+                        User(id=2, email="two@example.test", password="unused", verified=True),
+                        User(id=3, email="unverified@example.test", password="unused", verified=False)])
         self.client = self.app.test_client()
-        self.client.set_cookie("access_token", generate_jwt("one@example.invalid"))
+        self.client.set_cookie("access_token", generate_jwt("one@example.test"))
         with self.client.session_transaction() as session:
-            session["billing_csrf"] = "test-csrf"
+            session["csrf_token"] = "test-csrf"
         self.headers = {"Origin": "http://localhost:5000", "X-CSRF-Token": "test-csrf"}
         self.stripe = self.app.extensions["billing_providers"]["stripe"]
         self.lemon = self.app.extensions["billing_providers"]["lemonsqueezy"]
@@ -108,13 +118,13 @@ class BillingTests(unittest.TestCase):
     def test_checkout_requires_login_and_verified_account(self):
         self.client.delete_cookie("access_token")
         self.assertEqual(self.client.post("/billing/checkout", json={"plan": "monthly"}, headers=self.headers).status_code, 401)
-        self.client.set_cookie("access_token", generate_jwt("unverified@example.invalid"))
+        self.client.set_cookie("access_token", generate_jwt("unverified@example.test"))
         self.assertEqual(self.client.post("/billing/checkout", json={"plan": "monthly"}, headers=self.headers).status_code, 403)
 
     def test_csrf_and_cross_site_requests_rejected(self):
         for headers in ({}, {"Origin": "https://evil.invalid", "X-CSRF-Token": "test-csrf"},
                         {**self.headers, "Sec-Fetch-Site": "cross-site"}):
-            self.assertEqual(self.client.post("/billing/checkout", json={"plan": "monthly"}, headers=headers).status_code, 400)
+            self.assertEqual(self.client.post("/billing/checkout", json={"plan": "monthly"}, headers=headers).status_code, 403)
 
     def test_client_cannot_supply_price_provider_or_user(self):
         for payload in ({"plan": "unknown"}, {"plan": []}, {"plan": "monthly", "user_id": 2},
@@ -151,10 +161,15 @@ class BillingTests(unittest.TestCase):
         with patch.object(self.stripe, "subscription", return_value=self.snapshot()) as mocked:
             for _ in range(2):
                 self.assertEqual(self.client.post("/billing/webhooks/stripe", data=raw, headers=headers).status_code, 200)
+            mocked.assert_not_called()
+            with self.app.app_context():
+                self.assertTrue(process_one())
+                self.assertFalse(process_one())
             self.assertEqual(mocked.call_count, 1)
         with SessionLocal() as db:
             self.assertEqual(db.query(Subscription).count(), 1)
             self.assertEqual(db.query(WebhookReceipt).count(), 1)
+            self.assertEqual(db.query(WebhookInbox).count(), 1)
         with self.app.app_context():
             self.assertTrue(has_membership(1, "monthly"))
             self.assertFalse(has_membership(2))
@@ -172,23 +187,39 @@ class BillingTests(unittest.TestCase):
 
     def test_unknown_checkout_and_wrong_product_do_not_grant_access(self):
         raw, headers = self.signed_stripe()
-        self.assertEqual(self.client.post("/billing/webhooks/stripe", data=raw, headers=headers).status_code, 400)
+        self.assertEqual(self.client.post("/billing/webhooks/stripe", data=raw, headers=headers).status_code, 200)
+        with self.app.app_context(), patch.object(self.stripe, "subscription", return_value=self.snapshot()):
+            process_one()
+        with SessionLocal.begin() as db:
+            row = db.query(WebhookInbox).one()
+            self.assertEqual(row.status, 'retry')
+            row.available_at = datetime.utcnow() - timedelta(seconds=1)
         self.intent()
-        with patch.object(self.stripe, "subscription", return_value=self.snapshot(product_id="price_wrong")):
-            self.assertEqual(self.client.post("/billing/webhooks/stripe", data=raw, headers=headers).status_code, 400)
+        with self.app.app_context(), patch.object(self.stripe, "subscription", return_value=self.snapshot(product_id="price_wrong")):
+            process_one()
         with SessionLocal() as db:
             self.assertEqual(db.query(Subscription).count(), 0)
             self.assertEqual(db.query(WebhookReceipt).count(), 0)
+            self.assertEqual(db.query(WebhookInbox).one().status, 'needs_review')
 
     def test_provider_failure_rolls_back_receipt_for_retry(self):
         self.intent()
         raw, headers = self.signed_stripe()
-        with patch.object(self.stripe, "subscription", side_effect=ProviderUnavailable("Unavailable")):
-            self.assertEqual(self.client.post("/billing/webhooks/stripe", data=raw, headers=headers).status_code, 503)
-        with SessionLocal() as db:
-            self.assertEqual(db.query(WebhookReceipt).count(), 0)
-        with patch.object(self.stripe, "subscription", return_value=self.snapshot()):
+        with patch.object(self.stripe, "subscription", side_effect=ProviderUnavailable("Unavailable")) as mocked:
             self.assertEqual(self.client.post("/billing/webhooks/stripe", data=raw, headers=headers).status_code, 200)
+            mocked.assert_not_called()
+            with self.app.app_context():
+                process_one()
+        with SessionLocal.begin() as db:
+            self.assertEqual(db.query(WebhookReceipt).count(), 0)
+            row = db.query(WebhookInbox).one()
+            self.assertEqual(row.status, 'retry')
+            row.available_at = datetime.utcnow() - timedelta(seconds=1)
+        with self.app.app_context(), patch.object(self.stripe, "subscription", return_value=self.snapshot()):
+            process_one()
+        with SessionLocal() as db:
+            self.assertEqual(db.query(WebhookReceipt).count(), 1)
+            self.assertEqual(db.query(WebhookInbox).one().status, 'done')
 
     def test_delayed_events_use_current_state_and_refund_block_is_sticky(self):
         self.intent()
@@ -297,7 +328,7 @@ class BillingTests(unittest.TestCase):
             with patch.object(self.stripe, "request", side_effect=[
                     {"livemode": False, "active": True, "type": "recurring", "recurring": {"usage_type": "licensed"}},
                     {"livemode": False, "url": "https://checkout.stripe.com/test"}]) as mocked:
-                self.stripe.checkout(intent, "one@example.invalid")
+                self.stripe.checkout(intent, "one@example.test")
                 data = mocked.call_args.kwargs["data"]
                 self.assertEqual(data["subscription_data[metadata][checkout_ref]"], intent.id)
                 self.assertEqual(data["line_items[0][price]"], "price_monthly")
@@ -309,12 +340,12 @@ class BillingTests(unittest.TestCase):
             intent = db.get(CheckoutIntent, "opaque-reference")
             with patch.object(self.stripe, "request", return_value={"livemode": False, "active": True, "type": "one_time"}) as mocked:
                 with self.assertRaises(ProviderUnavailable):
-                    self.stripe.checkout(intent, "one@example.invalid")
+                    self.stripe.checkout(intent, "one@example.test")
                 self.assertEqual(mocked.call_count, 1)
             with patch.object(self.lemon, "request", return_value={"data": [{"attributes": {
                     "variant_id": "price_monthly", "category": "one_time", "scheme": "standard"}}]}) as mocked:
                 with self.assertRaises(ProviderUnavailable):
-                    self.lemon.checkout(intent, "one@example.invalid")
+                    self.lemon.checkout(intent, "one@example.test")
                 self.assertEqual(mocked.call_count, 1)
 
     def test_stripe_refunds_and_disputes_resolve_invoice_payments(self):
@@ -353,7 +384,7 @@ class BillingTests(unittest.TestCase):
                      {"data": {"attributes": {"test_mode": True, "url": "https://store.lemonsqueezy.com/checkout"}}}]
         with SessionLocal() as db, patch.object(self.lemon, "request", side_effect=responses) as mocked:
             intent = db.get(CheckoutIntent, "opaque-reference")
-            self.lemon.checkout(intent, "one@example.invalid")
+            self.lemon.checkout(intent, "one@example.test")
             attrs = mocked.call_args.kwargs["json"]["data"]["attributes"]
             self.assertEqual(attrs["checkout_data"]["custom"]["checkout_ref"], intent.id)
             self.assertEqual(attrs["product_options"]["enabled_variants"], [456])
@@ -384,11 +415,12 @@ class BillingTests(unittest.TestCase):
         self.intent()
         with self.app.app_context(), patch.object(self.stripe, "subscription", return_value=self.snapshot()):
             process_event("stripe", Event("evt_1", "created", "sub_1", "opaque-reference"))
-        with patch.object(self.stripe, "subscription", return_value=self.snapshot(status="canceled")):
+        with patch.object(self.stripe, 'list_subscriptions', return_value=([{'id':'sub_1','product_id':'price_monthly'}],None)), patch.object(self.lemon, 'list_subscriptions', return_value=([],None)):
             result = self.app.test_cli_runner().invoke(args=["billing-reconcile"])
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("Reconciled 1; failed 0", result.output)
-        with self.app.app_context():
+        self.assertIn('Queued 1',result.output)
+        with self.app.app_context(), patch.object(self.stripe, "subscription", return_value=self.snapshot(status="canceled")):
+            process_one()
             self.assertFalse(has_membership(1))
 
     def test_initial_schema_install_is_idempotent(self):
@@ -410,6 +442,8 @@ class BillingTests(unittest.TestCase):
             "parent": {"subscription_details": {"subscription": "sub_1"}}})
         with patch.object(self.stripe, "subscription", return_value=self.snapshot()):
             self.assertEqual(self.client.post("/billing/webhooks/stripe", data=raw, headers=headers).status_code, 200)
+            with self.app.app_context():
+                process_one()
         with self.app.app_context():
             self.assertTrue(has_membership(1))
 
@@ -463,11 +497,11 @@ class BillingTests(unittest.TestCase):
         import jwt
         from auth.config import JWT_SECRET
         from auth.db import create_refresh_token
-        expired = jwt.encode({'sub': 'one@example.invalid',
+        expired = jwt.encode({'sub': 'one@example.test',
                               'exp': datetime.utcnow() - timedelta(minutes=1)}, JWT_SECRET, algorithm='HS256')
         self.client.set_cookie('access_token', expired)
-        create_refresh_token(1, 'test-refresh-token', datetime.utcnow() + timedelta(days=30))
-        self.client.set_cookie('refresh_token', 'test-refresh-token')
+        create_refresh_token(1, 'test-refresh-token-with-enough-length', datetime.utcnow() + timedelta(days=30))
+        self.client.set_cookie('refresh_token', 'test-refresh-token-with-enough-length')
         with patch('billing.routes.membership_rows') as rows:
             page = self.client.get('/billing/membership?checkout=returned')
             self.assertEqual(page.status_code, 200)
@@ -475,7 +509,7 @@ class BillingTests(unittest.TestCase):
             self.assertEqual(page.headers['Cache-Control'], 'no-store')
             rows.assert_not_called()
         self.assertEqual(self.client.get('/billing/api/membership').status_code, 401)
-        self.assertEqual(self.client.post('/refresh').status_code, 200)
+        self.assertEqual(self.client.post('/refresh', headers=self.headers).status_code, 200)
         self.assertEqual(self.client.get('/billing/api/membership').status_code, 200)
         page = self.client.get('/billing/membership?checkout=returned')
         self.assertEqual(page.status_code, 200)
@@ -487,7 +521,7 @@ class BillingTests(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         self.assertIn(b'id="billing-session-recovery"', page.data)
         self.assertEqual(self.client.get('/billing/api/membership').status_code, 401)
-        self.assertEqual(self.client.post('/refresh').status_code, 401)
+        self.assertEqual(self.client.post('/refresh', headers=self.headers).status_code, 401)
         self.assertEqual(self.client.post('/billing/portal', json={'subscription_id': 1}, headers=self.headers).status_code, 401)
 
 

@@ -10,6 +10,7 @@ async function runRecovery(responses) {
     const retry = {hidden: true, addEventListener() {}};
     const recovery = {textContent: ''};
     const elements = {
+        'auth-csrf-token': {content: 'example'},
         'billing-root': {dataset: {}, querySelectorAll: () => []},
         'billing-message': {textContent: ''},
         'billing-session-recovery': recovery,
@@ -40,6 +41,7 @@ async function runPricing(responses) {
     const manage = {hidden: true, addEventListener() {}};
     const login = {hidden: true};
     const elements = {
+        'auth-csrf-token': {content: 'example'},
         'billing-root': {dataset: {}, querySelectorAll: selector =>
             selector === '[data-checkout-plan]' ? [subscribe] : selector === '[data-current-plan]' ? [marker] : []},
         'billing-message': {textContent: ''}, 'billing-plan-status': status,

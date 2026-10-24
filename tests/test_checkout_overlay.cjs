@@ -15,6 +15,7 @@ function harness(responses, {sdk = true, openThrows = false} = {}) {
     const button = {dataset: {checkoutPlan: 'monthly'}, disabled: false,
         addEventListener: (name, callback) => { callbacks.subscribe = callback; }, focus() { focused = true; }};
     const elements = {
+        'auth-csrf-token': {content: 'example'},
         'billing-root': {dataset: {csrf: 'example'}, querySelectorAll: selector =>
             selector === '[data-checkout-plan]' ? [button] : []},
         'billing-message': {textContent: ''},

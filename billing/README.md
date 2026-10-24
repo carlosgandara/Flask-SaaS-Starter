@@ -11,8 +11,9 @@ independent apps is introduced. Billing is disabled by default.
 | `__init__.py` | Register billing and maintenance commands |
 | `config.py` | Validate environment, canonical origin, provider credentials, plan catalog |
 | `routes.py` | HTTP input, authentication, CSRF, request limits, safe errors |
-| `service.py` | Checkout coordination, transactional webhook processing, membership rules |
-| `models.py` | Checkout intents, subscription projections, processed-event receipts |
+| `service.py` | Checkout coordination and transactional membership rules |
+| `models.py` | Checkout intents, subscriptions, receipts, inbox, leases and audit records |
+| `inbox.py`, `worker.py`, `leases.py` | Durable notifications, claims, retries and recovery |
 | `access.py` | Verified-user and paid-access decorators |
 | `providers/` | Provider API calls, signatures, normalized events/subscriptions |
 | `templates/billing/` | Pricing and membership pages |
@@ -68,20 +69,33 @@ pricing. A one-time payment product is rejected before creating checkout.
 Trials follow the provider's product configuration. There is no local free-trial
 counter or free access based on a browser flag.
 
-4. Before accepting checkout, create the initial billing tables explicitly:
+4. Apply the versioned database upgrade and run read-only readiness checks:
 
 ```bash
-flask --app app billing-init-db
+python -m flask --app app db-upgrade
+python -m flask --app app app-check
+python -m flask --app app billing-check
 ```
 
-This creates missing billing tables without changing existing auth data. It is
-an initial schema installer, not a migration engine. Future changes to existing
-columns require a reviewed schema migration; `create_all` will not alter them.
+`db-upgrade` upgrades the configured database without creating a second database.
+Back up and test existing installations on staging first. `billing-init-db` is a
+compatibility alias for this versioned upgrade, including auth changes. Existing
+users/subscriptions are preserved; see the root README for token-link transition
+and duplicate-email checks. `billing-check` calls provider GET endpoints only and
+checks store, mode and recurring plan IDs before any checkout is created.
 
 5. Configure webhooks at the provider. For local testing, use Stripe CLI or a
    trusted HTTPS tunnel. Keep `BASE_URL` equal to the origin actually used by the
    browser: mixing localhost and 127.0.0.1 will fail the Origin check.
-6. Start the app, register/verify/log in, and visit `/billing/pricing`.
+6. Start the web app. In a second terminal start the separate worker:
+
+```bash
+python -m flask --app app billing-worker
+```
+
+Register/verify/log in and visit `/billing/pricing`. Both processes load the same
+private environment and use the same database. The web app does not start an
+embedded worker. Run one or more supervised workers in production.
 
 Billing does not change `.env`, create products, charge cards, or change your Neon
 schema automatically. Real account configuration and a provider sandbox checkout
@@ -176,9 +190,12 @@ an equivalent signed timestamp; its raw-payload hash is the delivery identity,
 and current subscription state is fetched from the authenticated API rather than
 trusting an old signed payload. Lemon Squeezy store and test/live mode are checked.
 
-Events with an unknown checkout reference are rejected, not linked by email.
-Subscriptions created manually outside this app need an explicit operator-led
-import; they cannot grant access just by matching a user's address.
+Verified deliveries are committed to `billing_webhook_inbox` before HTTP 200.
+A database failure returns 503 so the provider retries. The HTTP handler makes
+no provider API calls. The worker applies supported deliveries; duplicates are
+safe. Unknown checkout references retry, then enter `needs_review`; subscriptions
+are never linked by email. Unsupported signed event types are acknowledged and
+ignored. Subscribe to the supported events above so relevant changes are delivered.
 
 ## Access and cancellation policy
 
@@ -229,74 +246,126 @@ rotate tokens. The API and billing actions remain authenticated.
 
 ## Concurrency, recovery, and deployment
 
-On PostgreSQL, checkout and webhook transactions lock the owning user row. This
-serializes updates across workers for that account while allowing unrelated
-users to proceed independently. Unique constraints deduplicate deliveries and
-subscription IDs. The receipt and subscription update commit in one transaction;
-a database or provider failure rolls back both so provider retries are safe.
-Current provider state is read under the lock, avoiding resurrection from delayed
-subscription events. No process-local billing membership cache is used.
+The web service verifies signatures and stores minimized linkage fields, not raw
+webhook bodies. Workers claim due jobs with PostgreSQL `SKIP LOCKED`. Claims expire
+after 120 seconds so a crashed worker's job becomes available again. Ownership
+tokens prevent an expired worker from finishing another worker's job.
 
-Processing is synchronous with bounded network timeouts and no automatic POST
-retries. This is a modest deployment starting point, not an unlimited-throughput
-queue. At higher webhook volume, place a durable verified-event inbox/worker
-before the same service boundary. Do not acknowledge a webhook before either
-the transaction or durable enqueue succeeds.
+Before reading provider state, the worker acquires a per-subscription database
+lease. Provider network calls happen outside transactions; a short final
+transaction verifies the lease, locks the user and commits membership plus its
+receipt atomically. This prevents stale snapshots from overwriting newer state
+without holding account locks during slow provider requests. Unique identities
+make duplicate delivery or a crash after commit safe.
 
-Run reconciliation regularly through your deployment scheduler and after a
-webhook outage:
+Transient failures use exponential backoff with jitter, capped at one hour.
+After eight attempts, or for malformed/permanent failures, the job enters
+`needs_review`. Safe error types and job IDs appear in logs; payloads, tokens and
+SQL parameters do not. Unprocessed jobs remain durable during a web/worker restart.
+
+Every 15 minutes by default, a worker queues current provider subscriptions and
+discovers purchases missing locally. A leader lease avoids duplicate scheduled
+scans, and each subscription retains its own processing lease. Stripe purchases
+with a recorded checkout reference can recover automatically. Lemon Squeezy's
+subscription listing does not expose the app's checkout reference: unmatched
+purchases enter review until a trusted operator explicitly links a known checkout.
+No email matching is used. Known subscriptions removed from the plan catalog still
+receive state reconciliation, although removed plans no longer grant paid access.
+Reconciliation does not reconstruct missing historical refund/dispute events;
+monitor provider notices and redeliver those events when needed.
+
+Operator commands (run in the protected deployment environment):
 
 ```bash
-flask --app app billing-reconcile
+# Readiness and backlog; --check exits nonzero for missing workers, lag >5m, review jobs.
+python -m flask --app app billing-status --check
+# List review jobs without exposing saved payloads.
+python -m flask --app app billing-jobs --status needs_review
+# Queue an immediate provider reconciliation (worker processes the jobs).
+python -m flask --app app billing-reconcile
+# Process at most one job without scheduled reconciliation.
+python -m flask --app app billing-worker --once
+# After investigating/fixing the cause, queue a retained review/retry job.
+python -m flask --app app billing-retry 42 --actor operator-name --reason "Reviewed provider state"
+# Link only after independently verifying purchase ownership and the checkout record.
+python -m flask --app app billing-retry 42 --actor operator-name --reason "Verified ownership" --checkout-ref KNOWN_CHECKOUT_REFERENCE
 ```
 
-It reads subscriptions in batches and refreshes their provider state. It exits
-nonzero on failures. It does not discover purchases with no local subscription,
-or replay refund/dispute actions: monitor and redeliver failed provider events.
-Access deadlines still expire without a background job, but immediate changes
-depend on webhook delivery or reconciliation. No scheduler is installed here.
+Retry records an operator action, reason and target job. The actor is an audit
+label; access is authorized by operating-system/deployment IAM permissions, not
+by this string. There is no public retry or membership-editing endpoint. The
+worker verifies immutable ownership and provider state again before granting
+access. Never invent a checkout reference or link by email alone.
 
-Live mode refuses startup without HTTPS `BASE_URL`, `COOKIE_SECURE=True`, secure
-session cookies, PostgreSQL, Redis rate-limit storage, matching provider mode,
-and configured secrets. Install the Redis dependency and provision Redis first.
-Use a production WSGI server behind HTTPS; `python app.py` is for development.
-The canonical Origin check uses configuration rather than untrusted Host headers.
-If reverse proxies must supply client IPs, configure trusted proxy counts for
-your actual deployment; do not blindly trust forwarded headers from the internet.
+### Understanding worker output
 
-For test and live, use separate deployments/databases and credentials. Database
-queries also scope mode explicitly. Plan keys/IDs and historical webhook receipts
-must survive deployments. Keep receipts to preserve replay protection; establish
-an operational retention policy before pruning. Never expose the database,
-provider secrets, checkout references/URLs, or signed portal links publicly.
+The worker runs continuously and can stay quiet when there are no pending jobs.
+Keep it open separately from the web server. On Windows, use the same project
+Python for every process so globally installed packages do not differ:
+
+```powershell
+.venv/Scripts/python.exe app.py
+# Separate terminal:
+.venv/Scripts/python.exe -m flask --app app billing-worker
+# Another terminal for a status snapshot:
+.venv/Scripts/python.exe -m flask --app app billing-status --check
+.venv/Scripts/python.exe -m flask --app app billing-jobs --status needs_review
+```
+
+For example, `Workers online: 1; oldest waiting event: 0s; event states:
+{'done': 2, 'needs_review': 2}` means a worker has reported recently, no jobs
+are waiting, two jobs finished and two require investigation. `--check` exits
+nonzero for review jobs even when the worker is running; that exit is intended
+for monitoring and does not indicate a worker crash.
+
+`billing.unmatched_purchase` means a subscription was found in the configured
+provider/store/mode/catalog without a corresponding local subscription or known
+checkout reference. The job is saved for review. This can happen with older test
+purchases or missing webhook processing, but the log alone does not establish the
+cause or ownership. Inspect the provider and original checkout records before
+linking/retrying. Starting another subscription does not resolve the missing link.
+
+Monitor `billing-status --check`, database availability and provider delivery
+failures with your hosting alert service. This repository supplies the checks,
+not a provisioned monitoring account. Heartbeats update every 30 seconds; a
+worker is considered stale after two minutes. Graceful termination finishes the
+current bounded operation; forced termination is recovered through expiring claims.
+
+Completed minimized payloads are cleared after 30 days by default. Deduplication
+identities/receipts remain, and review/failure payloads are retained for recovery.
+Restrict database access and define retention for audit/customer records. Tune
+`BILLING_POLL_SECONDS`, `BILLING_RECONCILE_SECONDS` and
+`BILLING_EVENT_RETENTION_DAYS` in the environment example.
+
+Production requires HTTPS, secure cookies, PostgreSQL and shared Redis request
+limits. Use `APP_ENV=production`, a production WSGI service and a separately
+supervised worker. Keep test/live deployments, databases and credentials separate.
+Use a permanent HTTPS webhook endpoint. Configure trusted proxy hops only for
+your actual private backend/proxy topology. Protect database/provider secrets,
+checkout URLs and signed portal links; do not log HTTP query strings or bodies.
 
 ## Debugging and verification
 
-Billing failures include `X-Request-ID`; server failure logs include that ID.
-Successful events log provider, event ID, and subscription ID. HTTP adapter logs
-include status/error type without response bodies or credentials. Do not enable
-verbose HTTP-wire logging in production. Inspect provider delivery logs and
-`billing_webhook_receipts` when debugging retries; the receipt exists only after
-the corresponding state transaction succeeds.
-
-Run the isolated security/regression suite:
+Browser errors include a safe reference and responses carry `X-Request-ID`.
+Worker logs carry job ID, state and exception type. Inspect provider deliveries,
+`billing_webhook_inbox` and receipts together: a receipt means the membership
+transaction completed, whereas an inbox row alone means the event was saved.
+An accepted HTTP 200 does not imply that the worker has processed it yet.
 
 ```bash
 python -m unittest discover -s tests -v
+node tests/test_auth_browser.cjs
+node tests/test_billing_browser.cjs
+node tests/test_checkout_overlay.cjs
+python -m pip_audit -r requirements.txt
 ```
 
-Tests use in-memory SQLite, mocked provider APIs, synthetic signing secrets, and
-no real customer data. They verify authentication, ownership, CSRF, signatures,
-mode isolation, duplicates, stale events, deadlines, refunds, rollback/retry,
-checkout reuse, provider request contracts, and recovery. SQLite does not test
-PostgreSQL locking. Before live use, exercise concurrent deliveries on a staging
-PostgreSQL database plus real provider sandbox checkout/portal/webhook flows.
-
-This is not a full audit of the pre-existing authentication system. Existing
-access JWTs can remain valid for their one-minute lifetime after logout/reset,
-and the original refresh rotation/account throttling code needs its own review
-for multi-worker concurrency. Billing adds database access checks; it does not
-claim to repair every pre-existing authentication limitation.
+Tests use synthetic credentials, isolated databases and mocked payment APIs.
+PostgreSQL/Redis tests require dedicated `TEST_POSTGRES_URL` / `TEST_REDIS_URL`;
+GitHub Actions provisions these services. Test a real provider sandbox checkout,
+portal, cancellation and webhook delivery before enabling live billing. This is
+a modest deployment architecture; benchmark queue lag and reconciliation time
+before increasing volume. It is not a completed independent security audit.
 
 ## Provider references
 
@@ -306,4 +375,5 @@ claim to repair every pre-existing authentication limitation.
 - [Stripe invoice payments](https://docs.stripe.com/api/invoice-payment/list)
 - [Lemon Squeezy checkout](https://docs.lemonsqueezy.com/api/checkouts/create-checkout)
 - [Lemon Squeezy signatures](https://docs.lemonsqueezy.com/help/webhooks/signing-requests)
+- [Lemon Squeezy subscription listing](https://docs.lemonsqueezy.com/api/subscriptions/list-all-subscriptions)
 - [Lemon Squeezy subscription lifecycle](https://docs.lemonsqueezy.com/api/subscriptions/the-subscription-object)

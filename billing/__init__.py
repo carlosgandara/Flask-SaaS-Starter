@@ -1,58 +1,41 @@
-"""Optional billing blueprint. No remote calls or schema changes during setup."""
+"""Optional billing registration. Setup never calls providers or changes schema."""
 
 import click
-
 from .config import load_config
 
 
 def init_billing(app):
-    app.config["MAX_CONTENT_LENGTH"] = min(app.config.get("MAX_CONTENT_LENGTH") or 262144, 262144)
     load_config(app)
     from .providers import build_providers
     from .routes import billing_bp
-
+    from .security import configure_overlay_policy
+    from .worker import init_worker_cli
     app.extensions["billing_providers"] = build_providers(app.config) if app.config["BILLING_ENABLED"] else {}
     app.register_blueprint(billing_bp)
-    from .security import configure_overlay_policy
     configure_overlay_policy(app)
+    init_worker_cli(app)
 
     @app.cli.command("billing-init-db")
     def init_db():
-        """Create the initial billing tables. Run once before enabling checkout."""
-        from auth.db import Base, engine
-        from .models import BILLING_TABLES
-        Base.metadata.create_all(bind=engine, tables=BILLING_TABLES)
-        click.echo("Billing tables created (existing data preserved).")
+        """Compatibility alias for db-upgrade; applies versioned schema changes."""
+        from auth.db import engine
+        from database_migrations import upgrade_database
+        upgrade_database(engine)
+        click.echo("Database schema is up to date (existing data preserved).")
 
-    @app.cli.command("billing-reconcile")
-    def reconcile():
-        """Refresh local subscriptions from provider state after missed webhooks."""
-        import secrets
-        from sqlalchemy import select
-        from auth.db import SessionLocal
-        from .models import Subscription
-        from .providers.base import Event
-        from .service import process_event
+    @app.cli.command("billing-check")
+    def billing_check():
+        """Read-only provider credential/store/price checks. Never creates checkout."""
         if not app.config["BILLING_ENABLED"]:
-            raise click.ClickException("Enable billing first")
-        # Keyset pagination keeps memory bounded as the subscription table grows.
-        last_id, count, failures = 0, 0, 0
-        while True:
-            with SessionLocal() as db:
-                rows = db.execute(select(Subscription).where(
-                    Subscription.id > last_id, Subscription.mode == app.config["BILLING_MODE"])
-                    .order_by(Subscription.id).limit(100)).scalars().all()
-            if not rows:
-                break
-            for row in rows:
-                last_id = row.id
-                try:
-                    process_event(row.provider, Event("reconcile_" + secrets.token_hex(16),
-                                                      "reconcile", row.external_id))
-                    count += 1
-                except Exception as exc:
-                    failures += 1
-                    app.logger.error("billing.reconcile_failed subscription=%s type=%s", row.id, type(exc).__name__)
-        click.echo(f"Reconciled {count}; failed {failures}.")
-        if failures:
-            raise click.ClickException("Some subscriptions could not be reconciled; check billing logs")
+            raise click.ClickException("Enable and configure billing first")
+        from .errors import BillingError
+        from .service import provider_for
+        try:
+            for name, provider in app.extensions["billing_providers"].items():
+                if hasattr(provider, 'check_store'):
+                    provider.check_store()
+            for key, plan in app.config["BILLING_PLANS"].items():
+                provider_for(plan["provider"]).validate_plan(plan["product_id"])
+                click.echo(f"Plan {key}: provider configuration is valid.")
+        except BillingError as exc:
+            raise click.ClickException(str(exc)) from None

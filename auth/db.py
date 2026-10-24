@@ -16,8 +16,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship, joinedload
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
 
 load_dotenv()
@@ -38,7 +37,7 @@ if not DATABASE_URL:
 # SQLALCHEMY SETUP
 # ================================================================
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, hide_parameters=True)
 
 SessionLocal = sessionmaker(
     autocommit=False,
@@ -92,6 +91,7 @@ class RefreshToken(Base):
         ForeignKey("users.id"),
         nullable=False,
     )
+    session_id = Column(String(64), ForeignKey("auth_sessions.id"), nullable=True, index=True)
 
     token_hash_sha256 = Column(String(64), nullable=False)
     token_hash_bcrypt = Column(String, nullable=False)
@@ -123,22 +123,31 @@ class RefreshToken(Base):
         )
 
 
-# Create missing tables without deleting existing data.
-Base.metadata.create_all(bind=engine)
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+
+    id = Column(String(64), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+
+
+class ActionToken(Base):
+    __tablename__ = "auth_action_tokens"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    purpose = Column(String(16), nullable=False)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    consumed_at = Column(DateTime, nullable=True)
 
 
 # ================================================================
 # USER DATABASE FUNCTIONS
 # ================================================================
-
-def get_all_users():
-    db = SessionLocal()
-
-    try:
-        return db.query(User).all()
-    finally:
-        db.close()
-
 
 def find_user_by_email(email):
     db = SessionLocal()
@@ -149,37 +158,6 @@ def find_user_by_email(email):
             .filter(User.email == email)
             .first()
         )
-    finally:
-        db.close()
-
-
-def find_user_by_verification_token(token):
-    db = SessionLocal()
-
-    try:
-        return (
-            db.query(User)
-            .filter(User.verification_token == token)
-            .first()
-        )
-    finally:
-        db.close()
-
-
-def find_user_by_reset_token(token):
-    db = SessionLocal()
-
-    try:
-        users = db.query(User).all()
-
-        for user in users:
-            if user.reset_token and bcrypt.checkpw(
-                token.encode("utf-8"),
-                user.reset_token.encode("utf-8"),
-            ):
-                return user
-
-        return None
     finally:
         db.close()
 
@@ -237,7 +215,7 @@ def update_user(email, updates):
 # REFRESH TOKEN DATABASE FUNCTIONS
 # ================================================================
 
-def create_refresh_token(user_id, raw_token, expires_at):
+def create_refresh_token(user_id, raw_token, expires_at, session_id=None):
     sha256_hash = hashlib.sha256(
         raw_token.encode("utf-8")
     ).hexdigest()
@@ -250,11 +228,17 @@ def create_refresh_token(user_id, raw_token, expires_at):
     db = SessionLocal()
 
     try:
+        if session_id is None:
+            import secrets
+            session_id = secrets.token_urlsafe(32)
+            db.add(AuthSession(id=session_id, user_id=user_id, expires_at=expires_at))
+            db.flush()
         token_record = RefreshToken(
             user_id=user_id,
             token_hash_sha256=sha256_hash,
             token_hash_bcrypt=bcrypt_hash,
             expires_at=expires_at,
+            session_id=session_id,
         )
 
         db.add(token_record)
@@ -267,120 +251,3 @@ def create_refresh_token(user_id, raw_token, expires_at):
         raise
     finally:
         db.close()
-
-
-def find_refresh_token_by_raw(raw_token):
-    """
-    Find an active token using its indexed SHA256 hash,
-    then verify it with bcrypt.
-
-    Load the associated user before closing the session.
-    """
-    sha256_hash = hashlib.sha256(
-        raw_token.encode("utf-8")
-    ).hexdigest()
-
-    db = SessionLocal()
-
-    try:
-        token_record = (
-            db.query(RefreshToken)
-            .options(joinedload(RefreshToken.user))
-            .filter(
-                RefreshToken.token_hash_sha256 == sha256_hash,
-                RefreshToken.revoked_at.is_(None),
-                RefreshToken.expires_at > datetime.datetime.utcnow(),
-            )
-            .first()
-        )
-
-        if not token_record:
-            return None
-
-        if bcrypt.checkpw(
-            raw_token.encode("utf-8"),
-            token_record.token_hash_bcrypt.encode("utf-8"),
-        ):
-            return token_record
-
-        return None
-    finally:
-        db.close()
-
-
-def revoke_refresh_token(token_id):
-    db = SessionLocal()
-
-    try:
-        token_record = (
-            db.query(RefreshToken)
-            .filter(RefreshToken.id == token_id)
-            .first()
-        )
-
-        if not token_record:
-            return False
-
-        token_record.revoked_at = datetime.datetime.utcnow()
-        db.commit()
-
-        return True
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-
-def revoke_all_user_tokens(user_id):
-    db = SessionLocal()
-
-    try:
-        (
-            db.query(RefreshToken)
-            .filter(
-                RefreshToken.user_id == user_id,
-                RefreshToken.revoked_at.is_(None),
-            )
-            .update({
-                "revoked_at": datetime.datetime.utcnow(),
-            })
-        )
-
-        db.commit()
-
-        return True
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-
-def get_active_refresh_tokens(user_id):
-    db = SessionLocal()
-
-    try:
-        return (
-            db.query(RefreshToken)
-            .filter(
-                RefreshToken.user_id == user_id,
-                RefreshToken.revoked_at.is_(None),
-                RefreshToken.expires_at > datetime.datetime.utcnow(),
-            )
-            .all()
-        )
-    finally:
-        db.close()
-
-
-# ================================================================
-# EXISTING COMPATIBILITY STUBS
-# ================================================================
-
-def _read_db():
-    return {"users": []}
-
-
-def _write_db(data):
-    pass

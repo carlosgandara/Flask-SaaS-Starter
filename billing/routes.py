@@ -6,25 +6,20 @@ from flask import Blueprint, current_app, g, jsonify, render_template, request, 
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from auth.routes import limiter
+from auth.extensions import limiter
+from auth.security import csrf_token, check_browser_request
 from .access import recover_page_session, verified_user_required
 from .errors import BillingError, InvalidWebhook
-from .service import TERMINAL_STATUSES, create_checkout, membership_rows, portal_url, process_event, provider_for
+from .service import TERMINAL_STATUSES, create_checkout, membership_rows, portal_url, provider_for
 
 
 billing_bp = Blueprint("billing", __name__, url_prefix="/billing", template_folder="templates",
                        static_folder="static")
 
 
-def csrf_token():
-    if "billing_csrf" not in session:
-        session["billing_csrf"] = secrets.token_urlsafe(32)
-    return session["billing_csrf"]
-
-
 @billing_bp.before_request
 def protect_billing():
-    g.billing_request_id = secrets.token_hex(12)
+    g.billing_request_id = getattr(g, "request_id", secrets.token_hex(12))
     if not current_app.config["BILLING_ENABLED"]:
         return jsonify(error="Billing is not configured"), 503
     if request.method == "POST":
@@ -62,13 +57,7 @@ def database_error(error):
 
 
 def require_csrf():
-    expected = session.get("billing_csrf", "")
-    supplied = request.headers.get("X-CSRF-Token", "")
-    origin = request.headers.get("Origin")
-    if (not expected or not secrets.compare_digest(expected.encode(), supplied.encode())
-            or origin != current_app.config["BILLING_BASE_URL"]
-            or request.headers.get("Sec-Fetch-Site") == "cross-site"):
-        raise BillingError("Invalid billing request. Reload the page and try again.")
+    check_browser_request()
 
 
 @billing_bp.get("/pricing")
@@ -120,12 +109,12 @@ def portal():
 @billing_bp.post("/webhooks/<provider>")
 @limiter.exempt
 def webhook(provider):
+    from .inbox import enqueue
     adapter = provider_for(provider)
     try:
-        event = adapter.event(request.get_data(), request.headers)
-        outcome = process_event(provider, event) if event else "ignored"
+        payload = adapter.verify_payload(request.get_data(), request.headers)
+        outcome = enqueue(provider, payload, g.billing_request_id)
     except (KeyError, TypeError, AttributeError, ValueError) as exc:
         raise InvalidWebhook("Malformed provider event") from exc
-    if event:
-        current_app.logger.info("billing.webhook provider=%s event=%s outcome=%s", provider, event.id, outcome)
+    current_app.logger.info("billing.webhook provider=%s outcome=%s request_id=%s", provider, outcome, g.billing_request_id)
     return jsonify(received=True)
