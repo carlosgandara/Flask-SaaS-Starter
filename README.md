@@ -1,220 +1,131 @@
-🔐 Python Flask JWT Authentication with Refresh Token Rotation
+# Flask authentication with optional subscription billing
 
-Enterprise-grade, production-ready authentication system built with Flask. Features HttpOnly cookies, refresh token rotation, silent frontend recovery, and Neon PostgreSQL.
+A Flask application with email verification, password reset, bcrypt password
+hashing, HttpOnly JWT cookies, refresh-token rotation, and optional hosted
+subscription checkout through Stripe or Lemon Squeezy.
 
-✨ Features
+## Project layout
 
-🔐 Register with email + password (bcrypt hashed)
+```text
+app.py                         Application creation and module registration
+auth/
+    __init__.py                Auth blueprint, limiter, security headers
+    routes.py                  Authentication pages and API
+    config.py                  Authentication environment settings
+    db.py                      Shared database engine and auth tables
+    mail_service.py            SMTP email
+    static/css/app.css
+    static/js/app.js
+    templates/auth/            Authentication HTML pages
+billing/
+    config.py                  Optional billing configuration and plan catalog
+    routes.py                  Checkout, portal, status, signed webhooks
+    service.py                 Transactional subscription rules
+    models.py                  Billing database tables
+    access.py                  Server-side paid-access checks
+    providers/                 Separate Stripe and Lemon Squeezy adapters
+    templates/billing/         Pricing and membership pages
+    static/js/billing.js
+    README.md                  Billing setup, policies, security, debugging
+.env.example                   Blank/example settings, no credentials
+tests/test_billing.py          Isolated billing regression/security tests
+```
 
-📧 Email verification (expires in 24h) – tokens are bcrypt hashed in the database
+Each independent app can reuse this starter with its own database and provider
+products. Authentication and billing tables live in that app's same database.
 
-🍪 HttpOnly Cookies – Tokens are invisible to JavaScript (XSS-safe)
+## Development setup
 
-🔑 JWT Access Token (short-lived, stored in HttpOnly cookie)
+1. Create a Python virtual environment and install dependencies:
 
-🔄 Refresh Token Rotation – Long-lived, dual-hash (SHA256 + bcrypt) in DB, invalidated on use (replay attack proof)
+```bash
+python -m venv venv
+# Git Bash on Windows:
+source venv/Scripts/activate
+pip install -r requirements.txt
+```
 
-🛡️ Silent Token Refresh – Frontend catches 401s, calls /refresh automatically, and retries requests
+2. Copy `.env.example` to `.env` and configure SMTP, DATABASE_URL, and
+   JWT_SECRET_KEY. Keep `.env` private. Generate a random JWT secret:
 
-📊 Protected Pages – /dashboard and /profile with cookie-based auth
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
 
-🚪 Secure Logout – Revokes refresh token in DB and deletes cookies
+The app refuses to start with a missing, blank, or shorter-than-32-byte JWT
+secret. PostgreSQL/Neon is recommended; without DATABASE_URL, auth falls back to
+local SQLite for development. Auth creates missing auth tables at import time.
+Use a separate database for tests and staging, never production customer data.
 
-🔁 Logout All Devices – Revokes all active sessions with one click
+3. Start locally:
 
-🔐 Change Password – Users can update their password (logs out all devices)
+```bash
+python app.py
+```
 
-🩺 Health Check – /health endpoint for load balancers and monitoring
+Open http://localhost:5000/login. Billing stays disabled until configured. Debug
+mode is off by default; enable it only in a private local development environment.
+Do not deploy Flask's development server to production.
 
-📨 Password Reset (expires in 15min) – tokens are bcrypt hashed
+## Authentication
 
-🖥️ Web UI – AJAX forms with automatic redirects
+- Register and verify your email, then log in.
+- Access tokens expire after one minute. Refresh tokens expire after 30 days.
+- The frontend refreshes an expired access token after a protected API returns
+  401. It does not run a one-minute refresh timer.
+- Reloading an HTML page after access-token expiry currently redirects to login.
+- Logout revokes refresh tokens. Existing access JWTs remain valid until expiry;
+  logout-all/reset do not immediately invalidate already-issued access JWTs.
+- `/health` is a basic application response, not an actual database connectivity
+  probe. Do not use its static database label as proof of database availability.
 
-🐘 PostgreSQL Database – Managed via Neon (serverless, scalable, auto-backup)
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET/POST | `/register` | Registration page / register |
+| GET | `/verify-email` | Verify emailed token |
+| GET/POST | `/login` | Login page / set auth cookies |
+| POST | `/refresh` | Rotate refresh token and issue access cookie |
+| GET | `/dashboard`, `/profile` | Authenticated HTML pages |
+| GET | `/protected` | Example authenticated API |
+| POST | `/logout`, `/logout-all` | Revoke refresh tokens and clear cookies |
+| GET/POST | `/forgot-password` | Reset request page / send email |
+| GET/POST | `/reset-password` | Reset page / update password |
+| GET | `/health` | Basic application status |
 
-⏱️ Rate Limiting – Per-IP and per-IP+User combo protection
+The application has no `/change-password` endpoint. Resetting a password uses the
+email flow. Browser actions use external scripts compatible with the strict CSP.
 
-🛡️ Strict CSP – No inline scripts/styles (XSS protection)
+## Billing
 
-🛠️ Tech Stack
+See [billing setup and architecture](billing/README.md) for provider configuration,
+webhook events, table installation, membership checks, cancellation/refund policy,
+and recovery commands. No real charges or provider products are created by setup.
 
-Backend: 🐍 Flask (Python 3.10+)
+```bash
+flask --app app billing-init-db
+python -m unittest discover -s tests -v
+```
 
-Auth: 🔐 PyJWT + bcrypt
+Billing has verified webhook signatures, CSRF-protected actions, ownership checks,
+server-owned plan IDs, transactional deduplication, PostgreSQL user-row locking,
+and explicit membership expiry. Live billing enforces HTTPS, secure cookies,
+PostgreSQL, and shared Redis rate-limit storage. Initial table creation is explicit;
+future existing-table changes need reviewed migrations.
 
-Cookies: 🍪 HttpOnly, Secure, SameSite=Lax
+## Security and operational scope
 
-Database: 🐘 PostgreSQL via Neon (serverless) with SQLAlchemy ORM
+Use long random secrets, production HTTPS, secure cookies, restricted database
+credentials, and monitored webhooks. The default rate-limit store is memory for
+local development; configure RATELIMIT_STORAGE_URI for shared limits. Authentication
+still contains process-local IP/user attempt tracking and non-atomic refresh
+rotation, which require a separate concurrency review before a multi-worker launch.
+This project is not a claim of a completed production security audit.
 
-Email: ✉️ SMTP (Brevo / Sendinblue / Gmail)
+Tests use a temporary in-memory database and mocked providers. Provider sandbox
+flows and PostgreSQL concurrent-delivery checks are required before real payments.
+See the billing documentation for the precise boundaries and remaining limitations.
 
-Frontend: 🌐 HTML + vanilla JS (combined in static files)
-
-Security Headers: 🛡️ Flask-Talisman (CSP, HSTS, X-Frame-Options)
-
-📁 Project Structure
-
-python-flask-jwt-auth/
-├── 🚀 app.py                      # Main Flask app with refresh endpoints
-├── ⚙️ config.py                   # Configuration + environment variables
-├── 🔒 .env                        # SMTP + JWT + DATABASE_URL secrets (ignored by Git)
-├── 📄 .gitignore                  # Ignores .env, __pycache__, etc.
-├── 📦 requirements.txt            # Python dependencies (Flask, SQLAlchemy, psycopg2, etc.)
-├── 📂 static/
-│   ├── 📁 css/
-│   │   └── 🎨 app.css             # Combined styles (loaded once)
-│   └── 📁 js/
-│       └── ⚡ app.js              # Combined JavaScript (loaded once)
-├── 📂 utils/
-│   ├── 🗃️ db.py                   # SQLAlchemy + PostgreSQL (Neon) with dual-hash refresh tokens
-│   └── ✉️ mail_service.py         # SMTP email sender
-└── 📂 templates/
-    ├── 🏗️ base.html               # Base layout (loads static files)
-    ├── 🔑 login.html              # Login form (redirects to dashboard)
-    ├── 📝 register.html           # Registration form
-    ├── 🔄 forgot_password.html    # Request reset link
-    ├── 🔐 reset_password.html     # Reset password form
-    ├── 📊 dashboard.html          # Protected dashboard (with silent refresh)
-    ├── 👤 profile.html            # Protected profile page
-    ├── ✅ verify_success.html     # Email verified
-    └── ❌ verify_error.html       # Verification failed
-
-🚀 Setup
-
-1. Clone the repository:
-   git clone https://github.com/carlosgandara/python-flask-jwt-auth.git
-   cd python-flask-jwt-auth
-
-2. Create and activate a virtual environment:
-   python -m venv venv
-   source venv/bin/activate      # Mac/Linux
-   venv\Scripts\activate         # Windows
-
-3. Install dependencies:
-   pip install -r requirements.txt
-
-4. Create a .env file (see example below):
-   EMAIL_HOST=smtp-relay.brevo.com
-   EMAIL_PORT=587
-   EMAIL_USER=your-smtp-username
-   EMAIL_PASS=your-smtp-password
-   EMAIL_FROM=your-email@example.com
-   JWT_SECRET_KEY=your-very-long-secret-min-32-chars
-   DATABASE_URL=postgresql://user:password@host/database
-   COOKIE_SECURE=False  # Set to True in production with HTTPS
-
-5. Run the app:
-   python app.py
-
-6. Open your browser:
-   Visit http://localhost:5000/login
-
-Note: .env is ignored by Git – your secrets stay safe.
-
-🌐 API Endpoints
-
-POST /register – Create user + send verification email (No auth required)
-GET /verify-email – Verify email with token (No auth required)
-POST /login – Set access_token and refresh_token as HttpOnly cookies (No auth required)
-POST /refresh – Rotate tokens (issue new Access + Refresh) (Refresh Cookie required)
-GET /protected – Test route – returns user email (Access Cookie required)
-GET /dashboard – Protected HTML page (Access Cookie required)
-GET /profile – Protected HTML page (Access Cookie required)
-POST /logout – Revoke refresh token + delete cookies (Access Cookie required)
-POST /logout-all – Revoke ALL active refresh tokens (Access Cookie required)
-POST /change-password – Update password (logs out all devices) (Access Cookie required)
-POST /forgot-password – Request password reset link (No auth required)
-POST /reset-password – Reset password with token (No auth required)
-GET /health – Health check for load balancers (No auth required)
-
-🧪 Testing with curl (Windows CMD)
-
-Important: The new flow uses HttpOnly cookies. Use -c to save cookies and -b to send them.
-
-1. Register:
-   curl -X POST http://localhost:5000/register -H "Content-Type: application/json" -d "{\"email\":\"test@example.com\",\"password\":\"StrongP@ssw0rd!\"}"
-
-2. Login (saves cookies to cookies.txt):
-   curl -X POST http://localhost:5000/login -H "Content-Type: application/json" -d "{\"email\":\"test@example.com\",\"password\":\"StrongP@ssw0rd!\"}" -c cookies.txt -i
-
-3. Access protected endpoint (uses saved cookie):
-   curl -X GET http://localhost:5000/protected -b cookies.txt
-
-4. Refresh tokens (rotation – kills old token):
-   curl -X POST http://localhost:5000/refresh -b cookies.txt -c cookies_new.txt -i
-
-5. Prove rotation works (reuse old token – fails):
-   curl -X POST http://localhost:5000/refresh -b cookies.txt
-   Expected: {"error": "Invalid or expired refresh token"} (replay attack blocked)
-
-6. Logout single device:
-   curl -X POST http://localhost:5000/logout -b cookies_new.txt -i
-
-7. Logout all devices:
-   curl -X POST http://localhost:5000/logout-all -b cookies_new.txt -i
-
-8. Health check:
-   curl -X GET http://localhost:5000/health
-
-👨‍💻 Web UI Walkthrough
-
-📝 Register – Fill in email/password → receive verification email.
-✅ Verify – Click the link in your email.
-🔑 Login – Enter credentials → automatically redirected to /dashboard.
-📊 Dashboard – Shows your protected user data. Click "Refresh Data" to test the API.
-👤 Profile – Another protected page (demonstrates cookie persistence).
-🔄 Silent Refresh – If you wait for the Access Token to expire (e.g., 1 min) and click "Refresh Data", the frontend silently calls /refresh and retries – you never see a login screen.
-🚪 Logout – Clears cookies and revokes the refresh token in the database.
-🔁 Logout All – Revokes all active sessions (great for lost devices).
-🔐 Change Password – Update your password; all devices are logged out automatically.
-
-✉️ Email Configuration
-
-Works with any SMTP provider:
-- Brevo (Sendinblue) – Recommended (free tier)
-- Gmail – Use an App Password
-- SendGrid, Mailgun, etc.
-
-🐘 Neon PostgreSQL Setup
-
-1. Sign up for Neon at https://neon.tech
-2. Create a new project
-3. Copy your connection string:
-   DATABASE_URL=postgresql://user:password@host/database
-4. Add it to your .env file
-
-🛡️ Security Highlights
-
-Password storage: bcrypt (12 rounds)
-JWT signing: HMAC-SHA256 with secret key
-Refresh tokens: Dual-hash strategy (SHA256 for index + bcrypt for verification)
-Refresh token rotation: Old tokens revoked on each refresh (replay attack proof)
-Multi-device support: Each login creates a separate refresh token row
-Cookies: HttpOnly (XSS-safe), Secure (HTTPS-only), SameSite=Lax (CSRF protection)
-CSP: Strict policy – no inline scripts/styles (XSS protection)
-Rate limiting: Per-IP and per-IP+User combo (in-memory for development)
-Verification tokens: bcrypt hashed (consistent with reset tokens)
-Reset tokens: bcrypt hashed
-
-✅ All 6 Original Security Issues Fixed
-
-1. ✅ Refresh token lookup – Dedicated table with SHA256 index (O(1) lookup)
-2. ✅ Multi-device support – Multiple refresh token rows per user
-3. ✅ X-Forwarded-For spoofing – Uses request.remote_addr directly
-4. ✅ secure=False hardcoded – Environment-driven COOKIE_SECURE
-5. ✅ CSP unsafe-inline – Static files + strict CSP (script-src 'self')
-6. ✅ Verification tokens – Now bcrypt hashed in the database
-
-🚀 Future Improvements
-
-- Add Redis for rate limiting (production ready, shared across servers)
-- Unit tests (pytest)
-- Admin panel
-- OAuth2 / OIDC support
-- Social login (Google, GitHub)
-- User roles and permissions (RBAC)
-
-📄 License
+## License
 
 MIT License
 
@@ -225,10 +136,3 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-👤 Author
-
-Carlos Gandara
-🔗 GitHub: https://github.com/carlosgandara
-
-⭐ If you found this useful, please give it a star!

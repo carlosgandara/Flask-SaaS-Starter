@@ -22,6 +22,7 @@ def init_auth(app):
     Talisman(
         app,
         force_https=False,
+        session_cookie_secure=app.config.get("SESSION_COOKIE_SECURE", True),
         frame_options="DENY",
         x_xss_protection=True,
         x_content_type_options="nosniff",

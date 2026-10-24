@@ -6,7 +6,7 @@
  * Authenticated fetch - automatically handles 401 errors
  * by calling /refresh and retrying the request.
  */
-async function authenticatedFetch(url, options = {}) {
+async function authenticatedFetch(url, options = {}, redirectOnFailure = true) {
     let response = await fetch(url, options);
     
     if (response.status === 401) {
@@ -23,7 +23,7 @@ async function authenticatedFetch(url, options = {}) {
                 setTimeout(() => { toast.className = ''; }, 2000);
             }
             response = await fetch(url, options);
-        } else {
+        } else if (redirectOnFailure) {
             window.location.href = '/login';
         }
     }
@@ -199,6 +199,7 @@ if (document.getElementById('api-response')) {
         }
     }
 
+    document.getElementById('refresh-data')?.addEventListener('click', fetchProtectedData);
     // Auto-fetch protected data when page loads
     window.onload = fetchProtectedData;
 }
@@ -222,3 +223,8 @@ if (document.getElementById('user-email')) {
     // Auto-fetch user info when page loads
     window.onload = fetchUserInfo;
 }
+
+// External listeners keep navigation actions compatible with the strict CSP.
+document.querySelectorAll('[data-action="logout"]').forEach(button => {
+    button.addEventListener('click', logout);
+});

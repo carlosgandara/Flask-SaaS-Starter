@@ -7,7 +7,8 @@
     <span><strong>🔒 MyApp</strong></span>
     <a href="/dashboard">Dashboard</a>
     <a href="/profile">Profile</a>
-    <button onclick="logout()">🚪 Logout</button>
+    {% if config.BILLING_ENABLED %}<a href="{{ url_for('billing.membership') }}">Membership</a>{% endif %}
+    <button type="button" data-action="logout">🚪 Logout</button>
 </div>
 
 <h1>👤 Your Profile</h1>

@@ -1,0 +1,19 @@
+{% extends "billing/base.html" %}
+{% block title %}Membership plans{% endblock %}
+{% block billing_content %}
+<h1>Membership plans</h1>
+<p id="billing-plan-status">Checking your membership…</p>
+<a id="billing-plan-login" href="{{ url_for('auth.login_page') }}" hidden>Log in</a>
+<button type="button" id="billing-manage-current" hidden>Manage billing</button>
+<noscript><p>Open <a href="{{ url_for('billing.membership') }}">Membership</a> to check your subscription.</p></noscript>
+{% for key, plan in plans.items() %}
+<article class="card">
+    <h2>{{ plan.name }}</h2>
+    <p data-current-plan="{{ key }}" hidden><strong>Your current plan</strong></p>
+    <p>{{ plan.description }}</p>
+    <p><strong>{{ plan.price_label }}</strong></p>
+    <p>Final pricing, taxes, and renewal terms are shown at checkout.</p>
+    <button type="button" data-checkout-plan="{{ key }}" hidden disabled>Subscribe</button>
+</article>
+{% endfor %}
+{% endblock %}
