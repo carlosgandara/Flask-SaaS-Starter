@@ -110,6 +110,7 @@
                 }
                 if (!response.ok) throw new Error('Membership check failed');
                 const data = await response.json();
+                if (root.dataset.checkoutCompleted === 'true') return;
                 if (data.can_subscribe) {
                     planStatus.textContent = 'You have no current subscription. Choose a plan to subscribe.';
                     root.querySelectorAll('[data-checkout-plan]').forEach(button => {

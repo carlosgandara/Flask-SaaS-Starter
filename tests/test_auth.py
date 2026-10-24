@@ -42,7 +42,7 @@ class AuthTests(unittest.TestCase):
 
     def test_register_verify_login_and_reject_reused_link(self):
         captured = []
-        with patch('auth.routes.send_email', side_effect=lambda to, subject, body: captured.append(body)):
+        with patch('auth.routes.send_email', side_effect=lambda to, subject, body, **kwargs: captured.append(body)):
             response = self.post('/register', {'email':' New@Example.TEST ', 'password':'StrongPass123!'})
         self.assertEqual(response.status_code, 200)
         raw = captured[0].split('?token=')[1]
@@ -55,6 +55,17 @@ class AuthTests(unittest.TestCase):
         self.assertEqual(self.client.get('/verify-email?token='+raw).status_code, 400)
         self.assertEqual(self.post('/login', {'email':'NEW@example.test','password':'StrongPass123!'}).status_code, 200)
         self.assertEqual(self.client.get('/protected').status_code, 200)
+
+    def test_action_emails_include_button_and_plain_text_fallback(self):
+        from auth.routes import notify
+        for purpose, label, expiry in [('verify','Verify your email','24 hours'),('reset','Reset your password','15 minutes')]:
+            with self.app.app_context(),patch('auth.routes.send_email') as send:
+                notify('one@example.test','test-token-value',purpose)
+            args,kwargs=send.call_args
+            self.assertIn('?token=test-token-value',args[2])
+            self.assertIn('>'+label+'</a>',kwargs['html'])
+            self.assertIn(expiry,kwargs['html'])
+            self.assertIn('copy and paste',kwargs['html'])
 
     def test_signup_duplicate_identity_is_generic(self):
         with self.app.app_context():

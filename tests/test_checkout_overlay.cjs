@@ -76,6 +76,8 @@ function harness(responses, {sdk = true, openThrows = false} = {}) {
     await pending.event({event: 'Checkout.Success', data: {status: 'active', has_access: true}});
     assert.deepEqual(pending.destinations, []);
     assert.equal(pending.button.disabled, true);
+    assert.equal(pending.button.hidden, true);
+    assert.equal(pending.elements['billing-message'].textContent, '');
     assert.match(pending.elements['billing-confirmation-status'].textContent, /do not need to pay again/);
     const count = pending.calls.length;
     await pending.event({event: 'Checkout.Success'});

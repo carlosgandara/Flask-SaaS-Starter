@@ -71,7 +71,9 @@ def notify(email, raw, purpose):
     label = "Verify your email" if purpose == "verify" else "Reset your password"
     link = current_app.config["APP_BASE_URL"] + endpoint + "?token=" + raw
     try:
-        send_email(email, label, label + ": " + link)
+        send_email(email, label, label + ": " + link,
+                   html=render_template("auth/emails/action.html", label=label, link=link,
+                                        expiry="24 hours" if purpose == "verify" else "15 minutes"))
     except Exception as exc:
         current_app.logger.error("auth.email_failed purpose=%s type=%s request_id=%s",
                                  purpose, type(exc).__name__, getattr(g, "request_id", ""))

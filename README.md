@@ -87,7 +87,8 @@ downgrade is intentionally unavailable. Restore a reviewed backup if rollback is
 - Expired HTML sessions recover through a data-free page. Browser refresh calls
   share one promise; Web Locks coordinate supported browsers across tabs.
 - SMTP delivery has a timeout and verified TLS. Delivery failures have a safe
-  reference; users can request a replacement link. Email is not a background queue.
+  reference; users can request a replacement link. Email is not a background queue. Verification/reset emails include an HTML action
+  button, expiry information and a plain-text fallback.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -115,11 +116,42 @@ Run the worker in a second terminal, with the same configuration and database:
 .venv/Scripts/python.exe -m flask --app app billing-worker
 ```
 
+The worker prints a database-check message, then confirms when it is online.
+Keep its terminal open; an idle worker does not exit. `Aborted!` alone does not
+identify a cause: startup may have been interrupted. Allow the database check
+to finish and inspect any preceding error. Status/review commands are documented
+in the billing guide.
+
 Signed payment notifications are committed to the database before acknowledgement.
 The separate worker fetches current provider state, updates membership atomically,
 retries failures and periodically reconciles provider subscriptions. Checkout
 success messages and redirect parameters never grant access. The worker must be
 running for membership updates to be applied.
+
+## Stable local webhook address
+
+Set `NGROK_DOMAIN` in your private `.env` to the development hostname assigned
+in your ngrok dashboard, without `https://` or a path. Keep
+`BASE_URL=http://localhost:5000` and browse the app through localhost.
+
+Stop the previous ngrok tunnel, then run in a separate terminal:
+
+```powershell
+.venv/Scripts/python.exe scripts/start_ngrok.py
+```
+
+This command always requests the configured domain and prints the exact webhook
+URL. Set that URL in Lemon Squeezy once; use the same launcher on future restarts.
+It fails rather than silently choosing another hostname. Do not commit your
+actual hostname or authtoken in the environment example. Keep three terminals
+running during local payment testing: Flask, the billing worker and this tunnel.
+A successful checkout with no membership can mean the notification is missing
+or queued: check the tunnel destination, then `billing-jobs --status pending`.
+Do not create another payment to repair a missing notification. The domain must belong
+to your ngrok account. Authentication stays in ngrok CLI configuration.
+`--check` validates/displays the configuration without opening a tunnel.
+The web app and billing worker still run separately. Restarting the tunnel does
+not automatically redeliver previously failed payment notifications.
 
 ## Production deployment
 
@@ -175,7 +207,9 @@ Redis tests remove only their own random key prefix. Never point test services
 at customer databases. GitHub Actions provisions both services and tests Python
 3.12/3.13, browser behavior and dependencies. Enable required checks in repository
 branch protection after the workflow is pushed; local files do not enable that setting.
-Exercise a real provider sandbox checkout, webhook and portal before live payments.
+The full local suite has also passed against temporary PostgreSQL/Redis services
+with no skipped checks. These automated checks do not replace an end-to-end
+provider sandbox checkout, webhook and portal exercise before live payments.
 
 ## License
 

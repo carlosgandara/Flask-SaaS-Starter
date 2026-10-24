@@ -137,9 +137,13 @@ def purge_completed_payloads():
 def worker_command(once):
     if not current_app.config['BILLING_ENABLED']:
         raise click.ClickException('Enable and configure billing first')
+    click.echo('Starting billing worker (' + current_app.config['BILLING_MODE'] + ' mode). Checking database schema...')
     from diagnostics import schema_problems
-    if not current_app.testing and schema_problems():
-        raise click.ClickException('Run db-upgrade before starting the worker')
+    try:
+        if not current_app.testing and schema_problems():
+            raise click.ClickException('Run db-upgrade before starting the worker')
+    except SQLAlchemyError as exc:
+        raise click.ClickException('Worker could not connect to/check the database (' + type(exc).__name__ + '). Check database connectivity and retry.') from None
     worker_id = secrets.token_hex(16)
     if once:
         heartbeat(worker_id)
@@ -158,6 +162,8 @@ def worker_command(once):
                 now = datetime.utcnow()
                 if now >= next_heartbeat:
                     heartbeat(worker_id)
+                    if next_heartbeat == datetime.min:
+                        click.echo('Billing worker online. Waiting for jobs; keep this terminal open. Press Ctrl+C to stop.')
                     next_heartbeat = now + timedelta(seconds=30)
                 if now >= next_reconcile:
                     try:
@@ -179,6 +185,7 @@ def worker_command(once):
     finally:
         for number, handler in previous.items():
             signal.signal(number, handler)
+        click.echo('Billing worker stopped.')
 
 
 def queue_status():

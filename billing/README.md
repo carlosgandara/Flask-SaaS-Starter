@@ -137,6 +137,11 @@ Inline scripts and arbitrary inline styles remain blocked. External presentation
 styles cover the vendor's generated loader and frame; provider-generated inline
 style attempts may still appear as blocked CSP messages in browser diagnostics.
 
+After the vendor reports checkout success, Subscribe buttons are hidden and the
+old "complete checkout" prompt is cleared while membership is confirmed. This
+prevents contradictory payment instructions without granting browser-controlled
+access.
+
 The vendor's Checkout.Success callback is presentation only. The page checks the
 authenticated membership API up to eight times over approximately 28 seconds,
 waiting for a matching plan with server-confirmed access. It then opens Membership.
@@ -299,7 +304,12 @@ access. Never invent a checkout reference or link by email alone.
 
 ### Understanding worker output
 
-The worker runs continuously and can stay quiet when there are no pending jobs.
+The worker prints `Starting billing worker (test mode). Checking database schema...`
+(or live mode), then `Billing worker online. Waiting for jobs; keep this terminal
+open. Press Ctrl+C to stop.` after its first successful heartbeat. It runs
+continuously and can stay quiet when there are no pending jobs. A startup database
+failure prints a safe connection/check error. `Aborted!` alone is not a diagnosis;
+allow startup to finish and inspect preceding output before assuming the cause.
 Keep it open separately from the web server. On Windows, use the same project
 Python for every process so globally installed packages do not differ:
 

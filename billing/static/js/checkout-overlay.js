@@ -26,6 +26,16 @@
         document.getElementById('billing-confirmation').hidden = false;
         const status = document.getElementById('billing-confirmation-status');
         status.textContent = 'Checkout completed. Confirming your membership…';
+        const message = document.getElementById('billing-message');
+        if (message) message.textContent = '';
+        const planStatus = document.getElementById('billing-plan-status');
+        if (planStatus) planStatus.textContent = 'Checkout completed. Waiting for membership confirmation. You do not need to pay again.';
+        const root = document.getElementById('billing-root');
+        root.dataset.checkoutCompleted = 'true';
+        root.querySelectorAll('[data-checkout-plan]').forEach(button => {
+            button.disabled = true;
+            button.hidden = true;
+        });
         // Bounded polling allows time for the signed webhook to reach the server.
         // Only the protected API's has_access result can confirm membership.
         for (let attempt = 0; attempt < 8; attempt += 1) {
