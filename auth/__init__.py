@@ -1,0 +1,41 @@
+# /auth/__init__.py
+
+from flask_talisman import Talisman
+
+from .config import JWT_SECRET
+
+
+def init_auth(app):
+    """
+    Connect authentication to an existing Flask application.
+
+    Call once after creating the Flask app.
+    """
+    from .routes import auth_bp, limiter
+
+    # Preserve an existing Flask session secret.
+    # Auth JWTs use JWT_SECRET directly in routes.py.
+    if not app.config.get("SECRET_KEY"):
+        app.config["SECRET_KEY"] = JWT_SECRET
+
+    # Preserve the existing security headers.
+    Talisman(
+        app,
+        force_https=False,
+        frame_options="DENY",
+        x_xss_protection=True,
+        x_content_type_options="nosniff",
+        content_security_policy={
+            "default-src": "'self'",
+            "script-src": "'self'",
+            "style-src": "'self'",
+            "img-src": ["'self'", "data:"],
+        },
+    )
+
+    # Activate the existing request limits.
+    limiter.init_app(app)
+
+    # Connect all authentication routes.
+    # No prefix keeps URLs such as /login unchanged.
+    app.register_blueprint(auth_bp)

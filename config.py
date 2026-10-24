@@ -19,7 +19,14 @@ COOKIE_SECURE = os.getenv("COOKIE_SECURE", "False").lower() == "true"
 BASE_URL = os.getenv("BASE_URL", "http://localhost:5000")  # ✅ Fixed
 
 # JWT
-JWT_SECRET = os.getenv("JWT_SECRET_KEY", "dev-secret")
+JWT_SECRET = os.getenv("JWT_SECRET_KEY")
+
+if not JWT_SECRET or len(JWT_SECRET.strip().encode("utf-8")) < 32:
+    raise EnvironmentError(
+        "JWT_SECRET_KEY must be configured with at least 32 bytes. "
+        "Generate a random secret with: "
+        "python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+    )
 
 # Expirations
 JWT_EXPIRATION = datetime.timedelta(minutes=1)
