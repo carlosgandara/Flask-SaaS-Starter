@@ -73,7 +73,8 @@ def require_csrf():
 
 @billing_bp.get("/pricing")
 def pricing():
-    return render_template("billing/pricing.html", plans=current_app.config["BILLING_PLANS"], csrf=csrf_token())
+    return render_template("billing/pricing.html", plans=current_app.config["BILLING_PLANS"], csrf=csrf_token(),
+                           lemon_overlay="lemonsqueezy" in current_app.extensions["billing_providers"])
 
 
 @billing_bp.get("/membership")
@@ -100,7 +101,8 @@ def checkout():
     data = request.get_json(silent=True)
     if not isinstance(data, dict) or set(data) != {"plan"} or not isinstance(data["plan"], str):
         raise BillingError("Select a valid plan")
-    return jsonify(url=create_checkout(g.billing_user.id, data["plan"]))
+    url = create_checkout(g.billing_user.id, data["plan"])
+    return jsonify(url=url, provider=current_app.config["BILLING_PLANS"][data["plan"]]["provider"])
 
 
 @billing_bp.post("/portal")

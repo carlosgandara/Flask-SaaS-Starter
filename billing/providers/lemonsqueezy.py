@@ -24,6 +24,7 @@ class LemonSqueezyProvider(Provider):
                 or price.get("scheme") != "standard" or price.get("usage_aggregation") is not None):
             raise ProviderUnavailable("The configured membership price is unavailable")
         payload = {"data": {"type": "checkouts", "attributes": {
+            "checkout_options": {"embed": True},
             "checkout_data": {"email": email, "custom": {"checkout_ref": intent.id}},
             "product_options": {"enabled_variants": [int(intent.product_id)],
                                 "redirect_url": self.config["BILLING_BASE_URL"] + "/billing/membership?checkout=returned"},

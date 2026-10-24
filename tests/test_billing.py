@@ -357,6 +357,7 @@ class BillingTests(unittest.TestCase):
             attrs = mocked.call_args.kwargs["json"]["data"]["attributes"]
             self.assertEqual(attrs["checkout_data"]["custom"]["checkout_ref"], intent.id)
             self.assertEqual(attrs["product_options"]["enabled_variants"], [456])
+            self.assertTrue(attrs['checkout_options']['embed'])
         with patch.object(self.lemon, "subscription_data", return_value=({}, {
                 "customer_id": 1, "urls": {"customer_portal": "https://store.lemonsqueezy.com/billing"}})):
             self.assertEqual(self.lemon.portal(Mock(external_id="99", customer_id="1")),
@@ -429,6 +430,34 @@ class BillingTests(unittest.TestCase):
         self.assertIsNone(data['current_subscription'])
         self.client.delete_cookie('access_token')
         self.assertEqual(self.client.get('/billing/api/membership').status_code, 401)
+
+    def test_overlay_permissions_are_scoped_to_pricing(self):
+        pricing = self.client.get('/billing/pricing')
+        policy = pricing.headers['Content-Security-Policy']
+        self.assertIn('https://app.lemonsqueezy.com/js/lemon.js', policy)
+        self.assertIn('https://assets.lemonsqueezy.com/lemon.js', policy)
+        self.assertIn('frame-src https://*.lemonsqueezy.com', policy)
+        self.assertNotIn("'unsafe-inline'", policy)
+        self.assertIn(b'js/checkout-overlay.js', pricing.data)
+        self.assertIn(b'billing-checkout-link', pricing.data)
+        for path in ('/login', '/billing/membership', '/billing/api/membership'):
+            response = self.client.get(path)
+            self.assertNotIn('lemonsqueezy.com', response.headers['Content-Security-Policy'])
+            self.assertNotIn(b'https://app.lemonsqueezy.com/js/lemon.js', response.data)
+
+    def test_stripe_only_app_does_not_load_lemon_script_or_relax_policy(self):
+        config = dict(self.app.config)
+        config['BILLING_PLANS'] = {'monthly': self.app.config['BILLING_PLANS']['monthly']}
+        app = create_app(config)
+        response = app.test_client().get('/billing/pricing')
+        self.assertNotIn(b'https://app.lemonsqueezy.com/js/lemon.js', response.data)
+        self.assertNotIn('lemonsqueezy.com', response.headers['Content-Security-Policy'])
+
+    def test_checkout_response_identifies_provider_without_leaking_secrets(self):
+        with patch.object(self.lemon, 'checkout', return_value='https://store.lemonsqueezy.com/checkout/custom/test'):
+            response = self.client.post('/billing/checkout', json={'plan': 'lemon'}, headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {'provider': 'lemonsqueezy', 'url': 'https://store.lemonsqueezy.com/checkout/custom/test'})
 
     def test_checkout_return_recovers_expired_session_without_exposing_membership(self):
         import jwt

@@ -13,6 +13,8 @@ def init_billing(app):
 
     app.extensions["billing_providers"] = build_providers(app.config) if app.config["BILLING_ENABLED"] else {}
     app.register_blueprint(billing_bp)
+    from .security import configure_overlay_policy
+    configure_overlay_policy(app)
 
     @app.cli.command("billing-init-db")
     def init_db():

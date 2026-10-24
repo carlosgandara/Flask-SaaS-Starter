@@ -17,6 +17,8 @@ independent apps is introduced. Billing is disabled by default.
 | `providers/` | Provider API calls, signatures, normalized events/subscriptions |
 | `templates/billing/` | Pricing and membership pages |
 | `static/js/billing.js` | Checkout and portal actions; no secrets or access decisions |
+| `static/js/checkout-overlay.js` | Lemon.js overlay lifecycle and bounded confirmation polling |
+| `security.py` | Payment script/frame permissions scoped to the pricing page |
 
 The tables use the existing SQLAlchemy engine and `users.id`. No card numbers,
 raw payment tokens, raw webhook bodies, or API credentials are stored in billing
@@ -105,6 +107,38 @@ limits; constrain webhook traffic at the edge as well. Bodies are limited to
 256 KiB for webhooks and 4 KiB for billing actions. Responses are not cached.
 
 ## Provider events
+
+### Checkout presentation
+
+Lemon Squeezy Subscribe opens the official Lemon.js checkout overlay, using the
+same server-created, account-linked checkout URL. Customers can close it and
+reopen the pending checkout. A full-page link remains available, and missing or
+failing overlay scripts fall back to hosted checkout without creating a second
+checkout. Stripe checkout and billing portals continue to use full-page redirects.
+
+Only the pricing page loads Lemon.js. Its content security policy permits the
+documented script URL and its exact CDN redirect (`assets.lemonsqueezy.com/lemon.js`),
+plus HTTPS Lemon Squeezy frames. Login, membership, and API policies stay unchanged.
+Inline scripts and arbitrary inline styles remain blocked. External presentation
+styles cover the vendor's generated loader and frame; provider-generated inline
+style attempts may still appear as blocked CSP messages in browser diagnostics.
+
+The vendor's Checkout.Success callback is presentation only. The page checks the
+authenticated membership API up to eight times over approximately 28 seconds,
+waiting for a matching plan with server-confirmed access. It then opens Membership.
+If confirmation is delayed or the network fails, the page points to Membership
+and explains that another payment is unnecessary. No order data from the callback
+is used to grant access. Test checkout, close/reopen, and payment-method behavior
+in your supported browsers before enabling live payments.
+
+Run browser-script checks without a network or actual payments:
+
+```bash
+node tests/test_billing_browser.cjs
+node tests/test_checkout_overlay.cjs
+```
+
+### Webhook destinations
 
 Stripe: configure a **snapshot** webhook destination using API version
 `2025-06-30.basil`, matching the adapter's pinned REST API version, for:

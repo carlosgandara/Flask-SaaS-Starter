@@ -16,4 +16,20 @@
     <button type="button" data-checkout-plan="{{ key }}" hidden disabled>Subscribe</button>
 </article>
 {% endfor %}
+<p id="billing-checkout-fallback" hidden>
+    Checkout not displaying?
+    <a id="billing-checkout-link" referrerpolicy="no-referrer">Open secure checkout in the full page</a>.
+    <button type="button" id="billing-close-checkout">Close checkout</button>
+</p>
+<p id="billing-confirmation" hidden>
+    <span id="billing-confirmation-status" role="status" aria-live="polite"></span>
+    <a href="{{ url_for('billing.membership') }}">View membership</a>
+</p>
+{% endblock %}
+{% block payment_assets %}
+{% if lemon_overlay %}
+<link rel="stylesheet" href="{{ url_for('billing.static', filename='css/checkout.css') }}">
+<script src="https://app.lemonsqueezy.com/js/lemon.js" defer></script>
+<script src="{{ url_for('billing.static', filename='js/checkout-overlay.js') }}" defer></script>
+{% endif %}
 {% endblock %}

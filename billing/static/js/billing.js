@@ -58,6 +58,25 @@
             }
             const target = new URL(data.url);
             if (target.protocol !== 'https:') throw new Error('Invalid payment destination.');
+            if (path === '/billing/checkout' && (target.username || target.password ||
+                (target.port && target.port !== '443') ||
+                (data.provider === 'lemonsqueezy' ? !target.hostname.endsWith('.lemonsqueezy.com') :
+                    data.provider !== 'stripe' || target.hostname !== 'checkout.stripe.com'))) {
+                throw new Error('Invalid payment destination.');
+            }
+            if (path === '/billing/checkout' && data.provider === 'lemonsqueezy' &&
+                window.BillingCheckoutOverlay?.open({
+                    url: target.href, plan: payload.plan, button,
+                    onClose() {
+                        busy = false;
+                        button.disabled = false;
+                        message.textContent = 'Checkout closed. You can reopen it when ready.';
+                    }
+                })) {
+                message.textContent = 'Complete your subscription in the secure checkout window.';
+                return;
+            }
+            // Stripe, unavailable vendor scripts and overlay failures use hosted checkout.
             window.location.assign(target.href);
         } catch (error) {
             message.textContent = error.message || 'Unable to connect. Try again later.';

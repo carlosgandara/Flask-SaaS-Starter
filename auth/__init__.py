@@ -19,7 +19,7 @@ def init_auth(app):
         app.config["SECRET_KEY"] = JWT_SECRET
 
     # Preserve the existing security headers.
-    Talisman(
+    app.extensions["security_headers"] = Talisman(
         app,
         force_https=False,
         session_cookie_secure=app.config.get("SESSION_COOKIE_SECURE", True),

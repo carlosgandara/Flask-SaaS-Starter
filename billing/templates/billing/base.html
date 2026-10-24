@@ -9,5 +9,6 @@
     {% block billing_content %}{% endblock %}
     <p id="billing-message" role="status" aria-live="polite"></p>
 </section>
+{% block payment_assets %}{% endblock %}
 <script src="{{ url_for('billing.static', filename='js/billing.js') }}" defer></script>
 {% endblock %}
