@@ -7,7 +7,7 @@ requests==2.34.2
 psycopg2-binary==2.9.13
 SQLAlchemy==2.0.55
 flask-talisman==1.1.0
-redis==8.1.0
+redis==8.2.0
 alembic==1.20.1
 email-validator==2.3.0
 waitress==3.0.2
